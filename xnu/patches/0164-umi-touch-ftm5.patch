@@ -386,7 +386,7 @@
  	for (unsigned v = 0; v < 2; v++) {
  		uint8_t id[2] = { 0, 0 };
  		uint8_t fw[FTS_FW_VER_BYTES] = { 0, 0 };
-@@ -1467,6 +1707,126 @@
+@@ -1467,6 +1707,139 @@
  }
  
  /*
@@ -411,19 +411,32 @@
 +ftm5_check_id(const char *when, uint8_t *high, uint8_t *low)
 +{
 +	uint8_t id[2] = { 0, 0 };
++	bool ok = false;
 +
-+	if (!fts_read_registers(FTM5_ADDR_DCHIP_ID, id, sizeof(id))) {
-+		printf("UMI TOUCH: FTM5 id %s: not acknowledged\n", when);
-+		return false;
++	/*
++	 * A part that was just reset may still be starting its application, so
++	 * the id is polled for two seconds instead of being believed on the
++	 * first read. A chip that is already running answers immediately.
++	 */
++	for (unsigned attempt = 0; attempt < 20; attempt++) {
++		id[0] = id[1] = 0;
++		ok = fts_read_registers(FTM5_ADDR_DCHIP_ID, id, sizeof(id));
++		if (ok && id[0] == FTM5_ID_0 && id[1] == FTM5_ID_1) {
++			*high = id[0];
++			*low = id[1];
++			return true;
++		}
++		if (attempt + 1 < 20) {
++			umi_spin_ms(100);
++		}
 +	}
-+	if (id[0] != FTM5_ID_0 || id[1] != FTM5_ID_1) {
++	if (!ok) {
++		printf("UMI TOUCH: FTM5 id %s: not acknowledged\n", when);
++	} else {
 +		printf("UMI TOUCH: FTM5 id %s: %02x %02x at 0x%08x, expected %02x %02x\n",
 +		    when, id[0], id[1], FTM5_ADDR_DCHIP_ID, FTM5_ID_0, FTM5_ID_1);
-+		return false;
 +	}
-+	*high = id[0];
-+	*low = id[1];
-+	return true;
++	return false;
 +}
 +
 +/*
@@ -513,7 +526,7 @@
   * umi_touch_intmon=1: the interrupt line, before the reset, while it is held,
   * and for a quarter of a second after it is let go; then a register read at
   * three clock rates, with the data line read again a millisecond after it.
-@@ -1520,7 +1880,8 @@
+@@ -1520,7 +1893,8 @@
  
  		bit_us = rates[i];
  		i2c_bus_recover();
@@ -523,7 +536,7 @@
  		printf("UMI TOUCH: bit_us %2u: id %02x %02x (%s)\n", bit_us, id[0], id[1],
  		    ok ? "acked" : "not acked");
  		line_release(pin_sda);
-@@ -1555,6 +1916,11 @@
+@@ -1555,6 +1929,11 @@
  	unsigned nonzero = 0;
  	bool present;
  
@@ -535,7 +548,7 @@
  	printf("UMI TOUCH: --- is the acknowledge ours? 0x48 has to stay silent ---\n");
  	i2c_ack_reset();
  	i2c_start();
-@@ -1596,11 +1962,11 @@
+@@ -1596,11 +1975,11 @@
  	for (unsigned address = 0; address < 0x100; address += 0x10) {
  		uint8_t want = 0x5a, back = 0;
  
@@ -549,7 +562,7 @@
  			printf("UMI TOUCH: %04x: written, the read was not acknowledged\n", address);
  			continue;
  		}
-@@ -1614,7 +1980,7 @@
+@@ -1614,7 +1993,7 @@
  	umi_spin_ms(50);
  	for (unsigned i = 0; i < 3; i++) {
  		uint8_t id[2] = { 0, 0 };
@@ -558,7 +571,7 @@
  
  		printf("UMI TOUCH: id %u: %02x %02x (%s), int %u\n", i, id[0], id[1],
  		    ok ? "acked" : "not acked", gpio_get(PIN_INT));
-@@ -1704,7 +2070,7 @@
+@@ -1704,7 +2083,7 @@
  	for (unsigned base = 0; base < 256; base += 16) {
  		for (unsigned i = 0; i < 16; i++) {
  			line[i] = 0xff;
@@ -567,7 +580,7 @@
  				line[i] = 0xfe; /* no acknowledge */
  			}
  		}
-@@ -1736,12 +2102,28 @@
+@@ -1736,12 +2115,28 @@
  	uint32_t diag = 0, avdd = 0, swap = 0, pp = 0, v = 0, pcycle = 0;
  	uint32_t ack = 0, scan = 0, mon = 0, proto = 0, clr = 0, pulses = 0;
  	uint32_t flash = 0, flash_diag = 0, fw_info = 0, flash_force = 0;
@@ -596,7 +609,7 @@
  	(void)PE_parse_boot_argn("umi_touch_diag", &diag, sizeof(diag));
  	(void)PE_parse_boot_argn("umi_touch_avdd", &avdd, sizeof(avdd));
  	(void)PE_parse_boot_argn("umi_touch_pcycle", &pcycle, sizeof(pcycle));
-@@ -1986,28 +2368,34 @@
+@@ -1986,28 +2381,34 @@
  		goto out;
  	}
  	show_pins("answering");
