@@ -1,0 +1,58 @@
+--- a/bsd/dev/umi_touch.c
++++ b/bsd/dev/umi_touch.c
+@@ -2223,19 +2223,36 @@
+ 
+ 		(void)PE_parse_boot_argn("umi_touch_supply", &supply, sizeof(supply));
+ 		if (supply || flash || flash_diag) {
+ 			extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+-			static const char *const rails[] = { "smpa4", "smpa5", "ldoc1" };
+ 
+ 			/*
+-			 * In the order the hardware wants them: the core rails first (a part
+-			 * whose core is dark acknowledges nothing and reads zero for every
+-			 * register), then the 1.8 V the pair's pull-ups hang from.
++			 * The four rails the touch node names in the device tree
++			 * (arch/arm64/boot/dts/vendor/qcom/kona-mtp.dtsi, st_fts@49):
++			 *
++			 *   vdd-supply  = <&pm8150a_l1>   1.8 V digital  -> cmd-db "ldoc1"
++			 *   avdd-supply = <&pm8150_l13>   3.0 V analog   -> cmd-db "ldo13"
++			 *
++			 * Without avdd the digital side runs - the chip id and the firmware
++			 * version read back - but the analog front end is dark, so the part
++			 * never produces a coordinate: the FIFO stays empty and INT stays
++			 * high no matter what the scan-mode or calibration commands answer.
++			 * That is exactly the shape of the symptom this driver first hit.
+ 			 */
++			static const struct {
++				const char *name;
++				unsigned mv;
++			} rails[] = {
++				{ "smpa4", 1800 },      /* touch core, first avdd variant */
++				{ "smpa5", 1800 },      /* touch core, second avdd variant */
++				{ "ldoc1", 1800 },      /* pm8150a_l1: vdd, the digital rail */
++				{ "ldo13", 3000 },      /* pm8150_l13: avdd, the analog rail */
++			};
++
+ 			for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+-				int e = sweet_rpmh_vreg_enable(rails[i], 1800);
+-
+-				printf("UMI TOUCH: %s -> %d\n", rails[i], e);
++				int e = sweet_rpmh_vreg_enable(rails[i].name, rails[i].mv);
++
++				printf("UMI TOUCH: %s (%u mV) -> %d\n", rails[i].name, rails[i].mv, e);
+ 				umi_spin_ms(10);
+ 			}
+ 			show_pins("rails on");
+ 
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -350,8 +350,9 @@
+ 		{ "ldoc11", 2950, 3400 },
+ 		{ "ldoc1",  1700, 1900 },
+ 		{ "smpa4",  1700, 1900 },
+ 		{ "smpa5",  1700, 1900 },
++		{ "ldo13",  2800, 3300 },      /* pm8150_l13: the umi touch analog rail (avdd, 3.0 V) */
+ 	};
+ 	unsigned lo = 0, hi = 0;
+ 
+ 	if (!res) {
