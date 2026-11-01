@@ -1,0 +1,88 @@
+--- a/bsd/dev/umi_touch.c
++++ b/bsd/dev/umi_touch.c
+@@ -693,8 +693,67 @@
+ 	return ok;
+ }
+ 
+ /* writeCmdU16: {0xB6, hi, lo, data ...} in one transaction. */
++/*
++ * FTM5/FTI, the protocol this part actually speaks (umi builds with
++ * CONFIG_TOUCHSCREEN_ST_FTS_V521, drivers/input/touchscreen/fts_521/):
++ * a command byte 0xFA followed by a 32-bit big-endian address, then the
++ * data. The 0xB6/16-bit-address form above belongs to the older st/ driver
++ * and reads zeros here.
++ */
++static bool
++fts_fa_read(uint32_t address, uint8_t *data, uint32_t length, bool dummy)
++{
++	bool ok;
++
++	i2c_start();
++	ok = i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
++	    i2c_write_byte(0xFA) &&
++	    i2c_write_byte((uint8_t)(address >> 24)) &&
++	    i2c_write_byte((uint8_t)(address >> 16)) &&
++	    i2c_write_byte((uint8_t)(address >> 8)) &&
++	    i2c_write_byte((uint8_t)(address));
++	if (ok) {
++		i2c_start();
++		ok = i2c_write_byte((uint8_t)(I2C_ADDRESS << 1 | 1)) != 0;
++		if (ok) {
++			if (dummy) {
++				(void)i2c_read_byte(true);
++			}
++			for (uint32_t i = 0; i < length; i++) {
++				data[i] = i2c_read_byte(i + 1 < length);
++			}
++		}
++	}
++	i2c_stop();
++	return ok;
++}
++
++/*
++ * umi_touch_fa=1: read the chip id and the firmware version through the
++ * FTM5/FTI command, both with and without the leading dummy byte, and print
++ * all four results. Reading 36 39 at 0x20000000 means the application is
++ * running and nothing needs to be flashed at all.
++ */
++static void
++fa_probe(void)
++{
++	uint8_t a[2] = {0, 0}, b[2] = {0, 0}, c[2] = {0, 0}, d[2] = {0, 0};
++
++	(void)fts_fa_read(0x20000000, a, 2, false);
++	(void)fts_fa_read(0x20000000, b, 2, true);
++	(void)fts_fa_read(0x20000004, c, 2, false);
++	(void)fts_fa_read(0x20000004, d, 2, true);
++	printf("UMI TOUCH: fa id  %02x %02x (no dummy) / %02x %02x (dummy)\n",
++	    a[0], a[1], b[0], b[1]);
++	printf("UMI TOUCH: fa ver %02x %02x (no dummy) / %02x %02x (dummy)\n",
++	    c[0], c[1], d[0], d[1]);
++	printf("UMI TOUCH: fa verdict: %s\n",
++	    ((a[0] == 0x36 && a[1] == 0x39) || (b[0] == 0x36 && b[1] == 0x39)) ?
++	    "application is running (id 36 39)" : "id not seen through 0xFA");
++}
++
+ static bool
+ fts_write_registers(uint16_t address, const uint8_t *data, uint32_t length)
+ {
+ 	bool ok;
+@@ -1753,8 +1812,17 @@
+ 		    PIN_SDA, PIN_INT, PIN_AVDD);
+ 	}
+ 	show_pins("as found");
+ 
++	{
++		uint32_t fa = 0;
++
++		(void)PE_parse_boot_argn("umi_touch_fa", &fa, sizeof(fa));
++		if (fa) {
++			fa_probe();
++		}
++	}
++
+ 	/*
+ 	 * The pair's pull-ups hang from ldoc1 (1.8 V), a rail Android turns on and
+ 	 * this boot path does not; without it the bus reads low and the chip looks
+ 	 * dead. sweet_rpmh_vreg_enable() places the vote through cmd-db.
