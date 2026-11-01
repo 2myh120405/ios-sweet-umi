@@ -68,10 +68,10 @@
  fts_write_registers(uint16_t address, const uint8_t *data, uint32_t length)
  {
  	bool ok;
-@@ -1753,8 +1812,17 @@
- 		    PIN_SDA, PIN_INT, PIN_AVDD);
- 	}
- 	show_pins("as found");
+@@ -1784,8 +1843,17 @@
+ 				umi_spin_ms(10);
+ 			}
+ 			show_pins("rails on");
  
 +	{
 +		uint32_t fa = 0;
@@ -83,6 +83,6 @@
 +	}
 +
  	/*
- 	 * The pair's pull-ups hang from ldoc1 (1.8 V), a rail Android turns on and
- 	 * this boot path does not; without it the bus reads low and the chip looks
- 	 * dead. sweet_rpmh_vreg_enable() places the vote through cmd-db.
+ 	 * umi_touch_pcycle=1: drop the touch core rail and bring it back with the
+ 	 * reset held low. A reset pulse alone does not clear a part that was left
+ 	 * half way through a byte by a previous run -- this port is booted with
