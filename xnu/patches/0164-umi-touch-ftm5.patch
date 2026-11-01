@@ -1,0 +1,648 @@
+--- a/bsd/dev/umi_touch.c
++++ b/bsd/dev/umi_touch.c
+@@ -27,12 +27,16 @@
+  *            display is lit, so it is left alone unless umi_touch_avdd=1.
+  *   panel    fts,x-max 1080, fts,y-max 2340, focaltech,max-touch-number 10.
+  *
+- * Protocol: no linear register file. A register access is command byte 0xB6
+- * plus a 16-bit address, and a read answers with one dummy byte in front of
+- * the data (ftsIO.c:readCmdU16). An event is a different shape: command 0x85
+- * and eight bytes back, no address and no dummy byte (fts.c:
+- * fts_event_handler). Getting the dummy byte wrong reads data shifted by one,
+- * which is what makes the part look dead.
++ * Protocol: FTM5/FTI, the one this part answers (umi builds with
++ * CONFIG_TOUCHSCREEN_ST_FTS_V521, drivers/input/touchscreen/fts_521/). A
++ * hardware register access is command byte 0xFA and a 32-bit big-endian
++ * address (ftsIO.c:fts_writeReadU8UX with BITS_32); with I2C_INTERFACE there
++ * is no dummy byte in front of the data (ftsHardware.h: DUMMY_HW_REG 0). An
++ * event read is command 0x86 (FIFO_CMD_READALL) and FIFO_EVENT_SIZE * n bytes
++ * back, again no address and no dummy byte (ftsCore.c:pollForEvent). Reading
++ * 36 39 at 0x20000000 means the application is running. The older
++ * 0xB6/16-bit-address and 0x85/8-byte protocol belongs to the previous st/
++ * driver and answers zeros on this part; umi_touch_legacy=1 still selects it.
+  *
+  * TLMM: the GPIO registers are not where soc/pinctrl@f000000 claims. That
+  * node is one 16 MiB window over three separate register tiles, named by the
+@@ -51,7 +55,12 @@
+  * Everything is off unless umi_touch=1 is on the boot-arg line. The other
+  * boot arguments are diagnostics and also default off:
+  *   umi_touch_verbose=1    one line per bring-up step, and raw events
+- *   umi_touch_diag=1       dump hardware registers 0x0000..0x00ff
++ *   umi_touch_legacy=1     speak the old st/ 0xB6 protocol instead of FTM5
++ *   umi_touch_events=1     one line per event: the raw eight bytes and the parse
++ *   umi_touch_reg_dump=1   FTM5 dump of 0x20000000..0x20000040
++ *   umi_touch_events_burst=N  events asked for in one 0x86 read (10, max 32)
++ *   umi_touch_scan_mode=N  active-scan bitmask written with command 0xA0 (0xff)
++ *   umi_touch_diag=1       dump hardware registers 0x0000..0x00ff (legacy)
+  *   umi_touch_flip=N       1 mirror left-right, 2 top-bottom, 3 both
+  *   umi_touch_pinswap=1    gpio37 is SDA and gpio36 is SCL
+  *   umi_touch_pushpull=1   drive SCL high instead of relying on the pull-up
+@@ -127,6 +136,42 @@
+ #define FTS_EVENT_SIZE           8       /* FIFO_EVENT_SIZE */
+ #define FTS_FIFO_DEPTH           32      /* FIFO_DEPTH */
+ 
++/* ---- FTM5/FTI: the protocol this part actually speaks ------------------------------------------ */
++
++#define FTM5_CMD_HW_REG          0xfa    /* FTS_CMD_HW_REG_R and _W, I2C_INTERFACE */
++#define FTM5_CMD_READ_ALL        0x86    /* FIFO_CMD_READALL, I2C_INTERFACE */
++#define FTM5_CMD_SCAN_MODE       0xa0    /* FTS_CMD_SCAN_MODE: mode, bitmask */
++#define FTM5_SCAN_MODE_ACTIVE    0x00    /* SCAN_MODE_ACTIVE */
++#define FTM5_SCAN_ACTIVE_ALL     0xff    /* every ACTIVE_* bit, the FTS5 reference's value */
++#define FTM5_ADDR_DCHIP_ID       0x20000000u   /* ADDR_DCHIP_ID: 36 39 when running */
++#define FTM5_ADDR_DCHIP_FW_VER   0x20000004u   /* ADDR_DCHIP_FW_VER */
++#define FTM5_ADDR_SYSTEM_RESET   0x20000024u   /* ADDR_SYSTEM_RESET (not used: reset pin) */
++#define FTM5_ADDR_BOOT_OPTION    0x20000025u   /* ADDR_BOOT_OPTION (never written) */
++#define FTM5_ADDR_IER            0x20000029u   /* ADDR_IER */
++#define FTM5_ADDR_ICR            0x2000002du   /* ADDR_ICR */
++#define FTM5_SYSTEM_RESET_VALUE  0x80    /* SYSTEM_RESET_VALUE */
++#define FTM5_IER_ENABLE          0x41    /* IER_ENABLE */
++#define FTM5_ID_0                0x36    /* DCHIP_ID_0 in FTM5 */
++#define FTM5_ID_1                0x39    /* DCHIP_ID_1 in FTM5 */
++#define FTM5_DUMMY_HW_REG        0       /* DUMMY_HW_REG with I2C_INTERFACE */
++#define FTM5_DUMMY_FIFO          0       /* DUMMY_FIFO with I2C_INTERFACE */
++#define FTM5_EVENT_BURST         10      /* events read by one 0x86, default */
++#define FTM5_EVENT_BURST_MAX     32      /* FIFO_DEPTH */
++
++/*
++ * Event ids, ftsSoftware.h:273-281. They are not the 0x03/0x04/0x05 of the
++ * st/ protocol: 0x03 here is CONTROLLER_READY and the touch events carry the
++ * whole id byte (0x13 enter, 0x23 motion, 0x33 leave).
++ */
++#define FTM5_EVENTID_CONTROLLER_READY 0x03
++#define FTM5_EVENTID_ENTER_POINTER    0x13
++#define FTM5_EVENTID_MOTION_POINTER   0x23
++#define FTM5_EVENTID_LEAVE_POINTER    0x33
++#define FTM5_EVENTID_STATUS_UPDATE    0x43
++#define FTM5_EVENTID_ERROR            0xf3
++#define FTM5_TOUCH_TYPE_MASK          0x0f
++#define FTM5_TOUCH_TYPE_HOVER         0x05
++
+ /*
+  * FTM3_CHIP is a compile-time switch in the vendor driver and it moves the
+  * ID, the firmware version and the reset register. Nothing says which one
+@@ -173,6 +218,15 @@
+ static uint32_t flip;
+ static bool pushpull;
+ static bool umi_verbose;
++/* umi_touch_legacy=1: the old 0xB6 protocol instead of FTM5 (default). */
++static bool umi_legacy;
++/* umi_touch_events=1: raw bytes and the parse, one line per event. */
++static bool umi_events;
++/* umi_touch_reg_dump=1: the FTM5 register window. */
++static bool umi_reg_dump;
++/* umi_touch_events_burst=N and umi_touch_scan_mode=N. */
++static uint32_t events_burst = FTM5_EVENT_BURST;
++static uint32_t scan_mode = FTM5_SCAN_ACTIVE_ALL;
+ static bool umi_started;
+ /* umi_touch=1: the full driver. False when only umi_touch_fw_info=1 asked. */
+ static bool umi_full;
+@@ -633,7 +687,7 @@
+  * register on this part). Dropping the dummy is not optional.
+  */
+ static bool
+-fts_read_registers(uint16_t address, uint8_t *data, uint32_t length)
++fts_read_registers_u16(uint16_t address, uint8_t *data, uint32_t length)
+ {
+ 	uint8_t buf[FTS_FIFO_DEPTH + 1];
+ 	bool ok = false;
+@@ -753,8 +807,22 @@
+ 	    "application is running (id 36 39)" : "id not seen through 0xFA");
+ }
+ 
++/*
++ * One hardware register through whichever protocol the boot arguments chose.
++ * FTM5 (the default) is 0xFA plus a 32-bit address and no dummy byte; the
++ * legacy path keeps the 0xB6/16-bit form so the two can be compared.
++ */
+ static bool
+-fts_write_registers(uint16_t address, const uint8_t *data, uint32_t length)
++fts_read_registers(uint32_t address, uint8_t *data, uint32_t length)
++{
++	if (umi_legacy) {
++		return fts_read_registers_u16((uint16_t)address, data, length);
++	}
++	return fts_fa_read(address, data, length, FTM5_DUMMY_HW_REG != 0);
++}
++
++static bool
++fts_write_registers_u16(uint16_t address, const uint8_t *data, uint32_t length)
+ {
+ 	bool ok;
+ 
+@@ -771,6 +839,37 @@
+ 	return ok;
+ }
+ 
++/* FTM5 write: {0xFA, address[4], data ...} in one transaction
++ * (ftsIO.c:fts_writeU8UX with BITS_32). */
++static bool
++fts_write_registers_ftm5(uint32_t address, const uint8_t *data, uint32_t length)
++{
++	bool ok;
++
++	i2c_ack_reset();
++	i2c_start();
++	ok = i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
++	    i2c_write_byte(FTM5_CMD_HW_REG) &&
++	    i2c_write_byte((uint8_t)(address >> 24)) &&
++	    i2c_write_byte((uint8_t)(address >> 16)) &&
++	    i2c_write_byte((uint8_t)(address >> 8)) &&
++	    i2c_write_byte((uint8_t)(address));
++	for (uint32_t i = 0; ok && i < length; i++) {
++		ok = i2c_write_byte(data[i]);
++	}
++	i2c_stop();
++	return ok;
++}
++
++static bool
++fts_write_registers(uint32_t address, const uint8_t *data, uint32_t length)
++{
++	if (umi_legacy) {
++		return fts_write_registers_u16((uint16_t)address, data, length);
++	}
++	return fts_write_registers_ftm5(address, data, length);
++}
++
+ /* A command is one byte out and nothing back (fts_writeCmd with one byte). */
+ static bool
+ fts_command(uint8_t command)
+@@ -790,7 +889,7 @@
+  * first byte is the event id; 0x00 means the FIFO is empty.
+  */
+ static bool
+-fts_read_event(uint8_t *event)
++fts_read_event_u16(uint8_t *event)
+ {
+ 	bool ok = false;
+ 
+@@ -811,6 +910,40 @@
+ 	return ok;
+ }
+ 
++/*
++ * FTM5 event read: command 0x86 (FIFO_CMD_READALL), repeated start, then
++ * count * FIFO_EVENT_SIZE bytes, no address and no dummy byte
++ * (ftsCore.c:196-207; ftsHardware.h FIFO_CMD_READALL and FIFO_EVENT_SIZE for
++ * I2C_INTERFACE). The answer is min(pending, count) events; an event whose
++ * first byte is 0x00 means the FIFO had nothing more.
++ */
++static bool
++fts_read_events_ftm5(uint8_t *events, uint32_t count)
++{
++	uint32_t total;
++	bool ok = false;
++
++	if (count == 0 || count > FTM5_EVENT_BURST_MAX) {
++		return false;
++	}
++	total = count * FTS_EVENT_SIZE;
++	memset(events, 0, total);
++	i2c_ack_reset();
++	i2c_start();
++	if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
++	    i2c_write_byte(FTM5_CMD_READ_ALL)) {
++		i2c_start();
++		if (i2c_write_read_address()) {
++			for (uint32_t i = 0; i < total; i++) {
++				events[i] = i2c_read_byte(i + 1 < total);
++			}
++			ok = true;
++		}
++	}
++	i2c_stop();
++	return ok;
++}
++
+ /* ---- the flash loader -------------------------------------------------------------------------- */
+ 
+ /*
+@@ -1049,7 +1182,7 @@
+ 			printf("UMI TOUCH: flash: loader 0xf9 %02x reads nothing\n", registers[i]);
+ 		}
+ 	}
+-	if (fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id))) {
++	if (fts_read_registers_u16(FTS_CHIP_ID_ADDR_A, id, sizeof(id))) {
+ 		printf("UMI TOUCH: flash: id 0x0004 reads %02x %02x%s\n", id[0], id[1],
+ 		    (id[0] || id[1]) ? "   <- the application is running" : "");
+ 	} else {
+@@ -1250,9 +1383,9 @@
+ 		for (unsigned j = 0; j < sizeof(page); j++) {
+ 			page[j] = 0;
+ 		}
+-		(void)fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+-		(void)fts_read_registers(FTS_FW_VER_ADDR_A, fwver, sizeof(fwver));
+-		(void)fts_read_registers(0x0000, page, sizeof(page));
++		(void)fts_read_registers_u16(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
++		(void)fts_read_registers_u16(FTS_FW_VER_ADDR_A, fwver, sizeof(fwver));
++		(void)fts_read_registers_u16(0x0000, page, sizeof(page));
+ 		if (id[0] || id[1]) {
+ 			bool match = (fwver[0] == (uint8_t)(version >> 8) &&
+ 			    fwver[1] == (uint8_t)(version & 0xff)) ||
+@@ -1351,27 +1484,102 @@
+ 	report_touch(id, event[0] != EVENTID_LEAVE_POINTER, x, y);
+ }
+ 
++/*
++ * One FTM5 touch event (ftsSoftware.h:273-281, the FTS5 event format):
++ *   event[0]  0x13 enter, 0x23 motion, 0x33 leave
++ *   event[1]  [7:4] touch id, [3:0] touch type (1 finger, 3 stylus, 5 hover)
++ *   event[2]  x bits 7..0
++ *   event[3]  [3:0] x bits 11..8, [7:4] y bits 11..8
++ *   event[4]  y bits 7..0
++ *   event[5]  pressure, [6]/[7] major/minor -- not needed to move a cursor
++ * Coordinates are 12-bit panel pixels (0..1079, 0..2339).
++ */
++static void
++parse_event_ftm5(const uint8_t *event)
++{
++	uint32_t id = (event[1] & 0xf0) >> 4;
++	uint32_t type = event[1] & FTM5_TOUCH_TYPE_MASK;
++	uint32_t x = (((uint32_t)event[3] & 0x0f) << 8) | event[2];
++	uint32_t y = ((uint32_t)event[4] << 4) | ((event[3] & 0xf0) >> 4);
++	bool down = event[0] != FTM5_EVENTID_LEAVE_POINTER;
++
++	if (down && type == FTM5_TOUCH_TYPE_HOVER) {
++		return;                 /* a hover is not a touch */
++	}
++	seen.reports++;
++	if (umi_events) {
++		printf("UMI TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x"
++		    " -> id %u type %u %s x %u y %u\n",
++		    event[0], event[1], event[2], event[3], event[4],
++		    event[5], event[6], event[7], id, type,
++		    down ? "down" : "up", x, y);
++	}
++	report_touch(id, down, x, y);
++}
++
+ static void
+ poll_report(void)
+ {
++	uint8_t events[FTM5_EVENT_BURST_MAX * FTS_EVENT_SIZE];
+ 	uint8_t event[FTS_EVENT_SIZE];
+ 	static unsigned shown_raw;
+ 
+ 	seen.polls++;
+ 	/*
+-	 * Drain the FIFO: the chip queues one event per finger per change, up to
+-	 * FIFO_DEPTH, and 0x00 means empty. Reading one event per look and
+-	 * stopping would leave a queue behind and the touch would lag.
++	 * FTM5: one 0x86 transaction brings back a burst of events. The chip
++	 * queues one event per finger per change, up to FIFO_DEPTH, and 0x00
++	 * means empty. Ask again while a whole burst came back, so a queue left
++	 * by a slow poll does not become lag.
++	 */
++	if (!umi_legacy) {
++		for (unsigned round = 0; round < 4; round++) {
++			bool full = true;
++
++			if (!fts_read_events_ftm5(events, events_burst)) {
++				seen.bad++;
++				return;
++			}
++			for (unsigned i = 0; i < events_burst; i++) {
++				const uint8_t *e = &events[i * FTS_EVENT_SIZE];
++
++				if (e[0] == EVENTID_NO_EVENT) {
++					full = false;
++					break;
++				}
++				switch (e[0]) {
++				case FTM5_EVENTID_ENTER_POINTER:
++				case FTM5_EVENTID_MOTION_POINTER:
++				case FTM5_EVENTID_LEAVE_POINTER:
++					parse_event_ftm5(e);
++					break;
++				default:
++					if (umi_events) {
++						printf("UMI TOUCH: event %02x %02x %02x %02x "
++						    "%02x %02x %02x %02x (not a touch)\n",
++						    e[0], e[1], e[2], e[3], e[4],
++						    e[5], e[6], e[7]);
++					}
++					break;
++				}
++			}
++			if (!full) {
++				return;
++			}
++		}
++		return;
++	}
++	/*
++	 * Legacy 0xB6/0x85: one event per transaction, 0x00 means empty.
+ 	 */
+ 	for (unsigned i = 0; i < FTS_FIFO_DEPTH; i++) {
+-		if (!fts_read_event(event)) {
++		if (!fts_read_event_u16(event)) {
+ 			seen.bad++;
+ 			return;
+ 		}
+ 		if (event[0] == EVENTID_NO_EVENT) {
+ 			return;
+ 		}
+-		if (umi_verbose && shown_raw < 8) {
++		if ((umi_verbose || umi_events) && shown_raw < 8) {
+ 			shown_raw++;
+ 			printf("UMI TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 			    event[0], event[1], event[2], event[3],
+@@ -1426,6 +1634,38 @@
+ 		{ FTS_CHIP_ID_ADDR_B, FTS_FW_VER_ADDR_B, FTS_ID_0_B, FTS_ID_1_B, "with FTM3_CHIP" },
+ 	};
+ 
++	if (!umi_legacy) {
++		uint8_t id[2] = { 0, 0 };
++		uint8_t fw[2] = { 0, 0 };
++		bool id_ok, fw_ok;
++
++		id_ok = fts_read_registers(FTM5_ADDR_DCHIP_ID, id, sizeof(id));
++		fw_ok = fts_read_registers(FTM5_ADDR_DCHIP_FW_VER, fw, sizeof(fw));
++		id_reads++;
++		if (id_ok) {
++			id_acked++;
++		} else {
++			id_naked++;
++		}
++		if (umi_ack || umi_verbose) {
++			printf("UMI TOUCH: FTM5 id 0x%08x: %02x %02x (%s); fw 0x%08x: "
++			    "%02x %02x (%s)\n", FTM5_ADDR_DCHIP_ID, id[0], id[1],
++			    id_ok ? "acked" : "not acked", FTM5_ADDR_DCHIP_FW_VER,
++			    fw[0], fw[1], fw_ok ? "acked" : "not acked");
++		}
++		if (!id_ok) {
++			return false;
++		}
++		if (id[0] != FTM5_ID_0 || id[1] != FTM5_ID_1) {
++			printf("UMI TOUCH: FTM5 id %02x %02x at 0x%08x, expected %02x %02x\n",
++			    id[0], id[1], FTM5_ADDR_DCHIP_ID, FTM5_ID_0, FTM5_ID_1);
++			return false;
++		}
++		*high = id[0];
++		*low = id[1];
++		return true;
++	}
++
+ 	for (unsigned v = 0; v < 2; v++) {
+ 		uint8_t id[2] = { 0, 0 };
+ 		uint8_t fw[FTS_FW_VER_BYTES] = { 0, 0 };
+@@ -1467,6 +1707,126 @@
+ }
+ 
+ /*
++ * ftsCore.c:188 pollForEvent, reduced to "wait for one event id": read one
++ * event at a time until the wanted id comes back or the timeout expires.
++ */
++static bool
++ftm5_wait_event(uint8_t wanted, uint32_t timeout_ms)
++{
++	uint8_t events[FTS_EVENT_SIZE];
++
++	for (uint32_t i = 0; i < timeout_ms; i++) {
++		if (fts_read_events_ftm5(events, 1) && events[0] == wanted) {
++			return true;
++		}
++		umi_spin_ms(1);
++	}
++	return false;
++}
++
++static bool
++ftm5_check_id(const char *when, uint8_t *high, uint8_t *low)
++{
++	uint8_t id[2] = { 0, 0 };
++
++	if (!fts_read_registers(FTM5_ADDR_DCHIP_ID, id, sizeof(id))) {
++		printf("UMI TOUCH: FTM5 id %s: not acknowledged\n", when);
++		return false;
++	}
++	if (id[0] != FTM5_ID_0 || id[1] != FTM5_ID_1) {
++		printf("UMI TOUCH: FTM5 id %s: %02x %02x at 0x%08x, expected %02x %02x\n",
++		    when, id[0], id[1], FTM5_ADDR_DCHIP_ID, FTM5_ID_0, FTM5_ID_1);
++		return false;
++	}
++	*high = id[0];
++	*low = id[1];
++	return true;
++}
++
++/*
++ * ftsCore.c:85 fts_system_reset: the board has a reset gpio, so the vendor
++ * path is a 10 ms low pulse, not a write to ADDR_SYSTEM_RESET; after it the
++ * driver polls for EVT_ID_CONTROLLER_READY (0x03), up to RETRY_SYSTEM_RESET
++ * (3) times. Then the application is up again and is asked for its id, the
++ * interrupt is enabled (ftsHardware.h: ADDR_IER <- IER_ENABLE 0x41) and
++ * scanning is switched on with FTS_CMD_SCAN_MODE (ftsCore.c:setScanMode).
++ * ADDR_BOOT_OPTION is defined by the reference but never written, and
++ * nothing here touches the firmware or the flash.
++ */
++static bool
++ftm5_init(uint8_t *high, uint8_t *low)
++{
++	uint8_t fw[2] = { 0, 0 };
++	uint8_t ier = FTM5_IER_ENABLE, ier_back = 0;
++	bool ready = false, ok;
++
++	if (reset_mode == 2) {
++		printf("UMI TOUCH: FTM5 reset skipped (umi_touch_reset=2)\n");
++	} else {
++		for (unsigned attempt = 0; attempt < 3 && !ready; attempt++) {
++			gpio_output(PIN_RESET, false, PULL_NONE, 2);
++			umi_spin_ms(10);
++			gpio_output(PIN_RESET, true, PULL_NONE, 2);
++			ready = ftm5_wait_event(FTM5_EVENTID_CONTROLLER_READY, 500);
++			printf("UMI TOUCH: FTM5 reset %u: controller ready %s\n",
++			    attempt + 1, ready ? "seen" : "not seen");
++		}
++	}
++	if (!ftm5_check_id("after reset", high, low)) {
++		return false;
++	}
++	(void)fts_read_registers(FTM5_ADDR_DCHIP_FW_VER, fw, sizeof(fw));
++	printf("UMI TOUCH: FTM5 id %02x %02x, fw %02x %02x at 0x%08x "
++	    "(application running)\n", *high, *low, fw[0], fw[1],
++	    FTM5_ADDR_DCHIP_FW_VER);
++
++	ok = fts_write_registers(FTM5_ADDR_IER, &ier, 1);
++	(void)fts_read_registers(FTM5_ADDR_IER, &ier_back, 1);
++	printf("UMI TOUCH: FTM5 IER 0x%08x <- 0x%02x: %s, read back %02x\n",
++	    FTM5_ADDR_IER, ier, ok ? "acked" : "not acked", ier_back);
++
++	{
++		uint8_t scan[3] = { FTM5_CMD_SCAN_MODE, FTM5_SCAN_MODE_ACTIVE,
++		    (uint8_t)scan_mode };
++
++		printf("UMI TOUCH: FTM5 scan mode %02x %02x: %s\n", scan[1], scan[2],
++		    fts_write_bytes(scan, sizeof(scan)) ? "acked" : "not acked");
++	}
++	/* Whatever the reset left in the FIFO is not a finger. */
++	for (unsigned i = 0; i < FTS_FIFO_DEPTH; i++) {
++		uint8_t events[FTS_EVENT_SIZE];
++
++		if (!fts_read_events_ftm5(events, 1) ||
++		    events[0] == EVENTID_NO_EVENT) {
++			break;
++		}
++	}
++	umi_spin_ms(20);
++	return true;
++}
++
++/* umi_touch_reg_dump=1: the FTM5 register window named by ftsHardware.h. */
++static void
++ftm5_reg_dump(void)
++{
++	uint8_t line[16];
++
++	printf("UMI TOUCH: FTM5 registers 0x20000000..0x20000040:\n");
++	for (uint32_t base = FTM5_ADDR_DCHIP_ID; base < 0x20000040; base += 16) {
++		for (unsigned i = 0; i < 16; i++) {
++			line[i] = 0xff;
++			if (!fts_read_registers(base + i, &line[i], 1)) {
++				line[i] = 0xfe; /* no acknowledge */
++			}
++		}
++		printf("UMI TOUCH: %08x: %02x %02x %02x %02x %02x %02x %02x %02x "
++		    "%02x %02x %02x %02x %02x %02x %02x %02x\n", base,
++		    line[0], line[1], line[2], line[3], line[4], line[5], line[6], line[7],
++		    line[8], line[9], line[10], line[11], line[12], line[13], line[14], line[15]);
++	}
++}
++
++/*
+  * umi_touch_intmon=1: the interrupt line, before the reset, while it is held,
+  * and for a quarter of a second after it is let go; then a register read at
+  * three clock rates, with the data line read again a millisecond after it.
+@@ -1520,7 +1880,8 @@
+ 
+ 		bit_us = rates[i];
+ 		i2c_bus_recover();
+-		ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
++		ok = fts_read_registers(umi_legacy ? FTS_CHIP_ID_ADDR_A : FTM5_ADDR_DCHIP_ID,
++		    id, sizeof(id));
+ 		printf("UMI TOUCH: bit_us %2u: id %02x %02x (%s)\n", bit_us, id[0], id[1],
+ 		    ok ? "acked" : "not acked");
+ 		line_release(pin_sda);
+@@ -1555,6 +1916,11 @@
+ 	unsigned nonzero = 0;
+ 	bool present;
+ 
++	if (!umi_legacy) {
++		printf("UMI TOUCH: proto scan is a 0xB6 diagnostic (it writes raw 16-bit "
++		    "addresses); skipped unless umi_touch_legacy=1\n");
++		return;
++	}
+ 	printf("UMI TOUCH: --- is the acknowledge ours? 0x48 has to stay silent ---\n");
+ 	i2c_ack_reset();
+ 	i2c_start();
+@@ -1596,11 +1962,11 @@
+ 	for (unsigned address = 0; address < 0x100; address += 0x10) {
+ 		uint8_t want = 0x5a, back = 0;
+ 
+-		if (!fts_write_registers((uint16_t)address, &want, 1)) {
++		if (!fts_write_registers_u16((uint16_t)address, &want, 1)) {
+ 			printf("UMI TOUCH: %04x: the write was not acknowledged\n", address);
+ 			continue;
+ 		}
+-		if (!fts_read_registers((uint16_t)address, &back, 1)) {
++		if (!fts_read_registers_u16((uint16_t)address, &back, 1)) {
+ 			printf("UMI TOUCH: %04x: written, the read was not acknowledged\n", address);
+ 			continue;
+ 		}
+@@ -1614,7 +1980,7 @@
+ 	umi_spin_ms(50);
+ 	for (unsigned i = 0; i < 3; i++) {
+ 		uint8_t id[2] = { 0, 0 };
+-		bool ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
++		bool ok = fts_read_registers_u16(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+ 
+ 		printf("UMI TOUCH: id %u: %02x %02x (%s), int %u\n", i, id[0], id[1],
+ 		    ok ? "acked" : "not acked", gpio_get(PIN_INT));
+@@ -1704,7 +2070,7 @@
+ 	for (unsigned base = 0; base < 256; base += 16) {
+ 		for (unsigned i = 0; i < 16; i++) {
+ 			line[i] = 0xff;
+-			if (!fts_read_registers((uint16_t)(base + i), &line[i], 1)) {
++			if (!fts_read_registers_u16((uint16_t)(base + i), &line[i], 1)) {
+ 				line[i] = 0xfe; /* no acknowledge */
+ 			}
+ 		}
+@@ -1736,12 +2102,28 @@
+ 	uint32_t diag = 0, avdd = 0, swap = 0, pp = 0, v = 0, pcycle = 0;
+ 	uint32_t ack = 0, scan = 0, mon = 0, proto = 0, clr = 0, pulses = 0;
+ 	uint32_t flash = 0, flash_diag = 0, fw_info = 0, flash_force = 0;
++	uint32_t legacy = 0, ev = 0, rdump = 0, burst = FTM5_EVENT_BURST;
++	uint32_t scanmask = FTM5_SCAN_ACTIVE_ALL;
+ 	uint8_t high = 0, low = 0;
+ 	unsigned idle = 0, idle_looks;
+ 	bool found = false;
+ 
+ 	(void)PE_parse_boot_argn("umi_touch_verbose", &v, sizeof(v));
+ 	umi_verbose = v != 0;
++	(void)PE_parse_boot_argn("umi_touch_legacy", &legacy, sizeof(legacy));
++	(void)PE_parse_boot_argn("umi_touch_events", &ev, sizeof(ev));
++	(void)PE_parse_boot_argn("umi_touch_reg_dump", &rdump, sizeof(rdump));
++	(void)PE_parse_boot_argn("umi_touch_events_burst", &burst, sizeof(burst));
++	(void)PE_parse_boot_argn("umi_touch_scan_mode", &scanmask, sizeof(scanmask));
++	umi_legacy = legacy != 0;
++	umi_events = ev != 0;
++	umi_reg_dump = rdump != 0;
++	if (burst >= 1 && burst <= FTM5_EVENT_BURST_MAX) {
++		events_burst = burst;
++	}
++	if (scanmask <= 0xff) {
++		scan_mode = scanmask;
++	}
+ 	(void)PE_parse_boot_argn("umi_touch_diag", &diag, sizeof(diag));
+ 	(void)PE_parse_boot_argn("umi_touch_avdd", &avdd, sizeof(avdd));
+ 	(void)PE_parse_boot_argn("umi_touch_pcycle", &pcycle, sizeof(pcycle));
+@@ -1986,28 +2368,34 @@
+ 		goto out;
+ 	}
+ 	show_pins("answering");
+-	if (diag) {
+-		register_dump();
++	if (umi_reg_dump || diag) {
++		if (umi_legacy) {
++			register_dump();
++		} else {
++			ftm5_reg_dump();
++		}
+ 	}
+-	/*
+-	 * A chip that has just been reset is not scanning the panel and is not
+-	 * driving its interrupt line, so neither the FIFO nor gpio39 would ever
+-	 * say anything. The vendor driver does these two things on resume
+-	 * (fts.c: fts_command(FTS_CMD_MS_MT_SENSE_ON) and IER_ENABLE to
+-	 * IER_ADDR); without them this loop would poll an idle part forever and
+-	 * look exactly like a driver that cannot read the chip.
+-	 */
+-	{
++	if (umi_legacy) {
++		/*
++		 * Legacy 0xB6/0x85 path: sense-on command and IER at 0x001c, as
++		 * the previous st/ driver does on resume.
++		 */
+ 		uint8_t ier = FTS_IER_ENABLE;
+ 		bool sense_ok = fts_command(FTS_CMD_SENSE_ON);
+-		bool ier_ok = fts_write_registers(FTS_IER_ADDR, &ier, 1);
++		bool ier_ok = fts_write_registers_u16(FTS_IER_ADDR, &ier, 1);
+ 
+-		printf("UMI TOUCH: sense on: %s; interrupt enable: %s\n",
++		printf("UMI TOUCH: legacy sense on: %s; interrupt enable: %s\n",
+ 		    sense_ok ? "acked" : "not acked", ier_ok ? "acked" : "not acked");
+ 		umi_spin_ms(20);
++	} else if (!ftm5_init(&high, &low)) {
++		printf("UMI TOUCH: FTM5 init failed; not starting the poll loop\n");
++		show_pins("init failed");
++		goto out;
+ 	}
+-	printf("UMI TOUCH: FingerTipS ready at %#x, sda gpio%u / scl gpio%u, poll every %u us, panel %ux%u\n",
+-	    I2C_ADDRESS, pin_sda, pin_scl, poll_us, PANEL_X, PANEL_Y);
++	printf("UMI TOUCH: FingerTipS ready at %#x (%s), sda gpio%u / scl gpio%u, "
++	    "poll every %u us, panel %ux%u\n",
++	    I2C_ADDRESS, umi_legacy ? "0xB6 legacy" : "FTM5/FTI",
++	    pin_sda, pin_scl, poll_us, PANEL_X, PANEL_Y);
+ 
+ 	idle_looks = 80000 / poll_us;   /* read every 80 ms even if the line stays high */
+ 	for (unsigned tick = 1;; tick++) {
