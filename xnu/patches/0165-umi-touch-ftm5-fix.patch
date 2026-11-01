@@ -1,0 +1,234 @@
+--- a/bsd/dev/umi_touch.c
++++ b/bsd/dev/umi_touch.c
+@@ -57,9 +57,14 @@
+  *   umi_touch_verbose=1    one line per bring-up step, and raw events
+  *   umi_touch_legacy=1     speak the old st/ 0xB6 protocol instead of FTM5
+  *   umi_touch_events=1     one line per event: the raw eight bytes and the parse
++ *   umi_touch_events_raw=1 the raw eight bytes only: no parse, no report
++ *   umi_touch_cal=0        skip sleep-out/CX tuning/force calibration/host
++ *                          interrupt enable (on by default: see ftm5_wake_calibrate)
++ *   umi_touch_ier=1        also write ADDR_IER 0x20000029 <- 0x41, which the
++ *                          vendor driver never does (it is what 0164 did)
+  *   umi_touch_reg_dump=1   FTM5 dump of 0x20000000..0x20000040
+  *   umi_touch_events_burst=N  events asked for in one 0x86 read (10, max 32)
+- *   umi_touch_scan_mode=N  active-scan bitmask written with command 0xA0 (0xff)
++ *   umi_touch_scan_mode=N  active-scan bitmask written with command 0xA0 (0x01)
+  *   umi_touch_diag=1       dump hardware registers 0x0000..0x00ff (legacy)
+  *   umi_touch_flip=N       1 mirror left-right, 2 top-bottom, 3 both
+  *   umi_touch_pinswap=1    gpio37 is SDA and gpio36 is SCL
+@@ -171,6 +176,38 @@
+ #define FTM5_EVENTID_ERROR            0xf3
+ #define FTM5_TOUCH_TYPE_MASK          0x0f
+ #define FTM5_TOUCH_TYPE_HOVER         0x05
++/*
++ * The id is in the top nibble of event[0] only: its low nibble carries major
++ * bits 5:4 (stmfts5_report_contact_event in the mainline FTS5 driver), and the
++ * vendor's own dispatcher indexes its table with event[0] >> 4
++ * (fts.c:4391 eventId = evt_data[0] >> 4). Comparing the whole byte against
++ * 0x13 therefore drops every report whose low nibble is not 3.
++ */
++#define FTM5_EVENTID_MASK             0xf0
++#define FTM5_EVENTID_ENTER            0x10    /* STMFTS5_EV_MULTI_TOUCH_ENTER */
++#define FTM5_EVENTID_MOTION           0x20    /* STMFTS5_EV_MULTI_TOUCH_MOTION */
++#define FTM5_EVENTID_LEAVE            0x30    /* STMFTS5_EV_MULTI_TOUCH_LEAVE */
++
++/* ---- FTM5 wake, calibrate, host interrupt: what a pin reset does not do ------------------------- */
++
++/*
++ * A reset pulse only brings the application up. It leaves the analogue front
++ * end asleep and uncalibrated, and the host interrupt is not routed to the
++ * pad. The four one-byte commands and the register write below are the block
++ * the mainline FTS5 driver runs before it enables scanning
++ * (stmfts5_chip_runtime_resume, "Input: stmfts - support FTS5" v7 3/4); the
++ * same four commands are stmfts_configure's for FTM4. The interrupt is not
++ * ADDR_IER 0x20000029 -- the vendor FTM5 driver defines that register and its
++ * 0x41 value and never writes either -- but hardware register 0x002C, written
++ * the legacy way with 0xB6, a 16-bit address and the value.
++ */
++#define FTM5_CMD_SLEEP_OUT            0x91    /* STMFTS_SLEEP_OUT */
++#define FTM5_CMD_MS_CX_TUNING         0xa3    /* STMFTS_MS_CX_TUNING */
++#define FTM5_CMD_SS_CX_TUNING         0xa4    /* STMFTS_SS_CX_TUNING */
++#define FTM5_CMD_FORCE_CAL            0xa2    /* STMFTS_FULL_FORCE_CALIBRATION */
++#define FTM5_REG_HOST_INT             0x002c  /* HW register, 16-bit address space */
++#define FTM5_HOST_INT_ENABLE          0x01
++#define FTM5_SCAN_ACTIVE_MT           0x01    /* ACTIVE_MULTI_TOUCH, fts.c:5178 */
+ 
+ /*
+  * FTM3_CHIP is a compile-time switch in the vendor driver and it moves the
+@@ -226,7 +263,13 @@
+ static bool umi_reg_dump;
+ /* umi_touch_events_burst=N and umi_touch_scan_mode=N. */
+ static uint32_t events_burst = FTM5_EVENT_BURST;
+-static uint32_t scan_mode = FTM5_SCAN_ACTIVE_ALL;
++static uint32_t scan_mode = FTM5_SCAN_ACTIVE_MT;
++/* umi_touch_cal=0: skip the wake/tune/calibrate block (it is on by default). */
++static bool umi_cal = true;
++/* umi_touch_ier=1: also poke ADDR_IER 0x20000029, which the vendor never does. */
++static bool umi_ier;
++/* umi_touch_events_raw=1: print every event's bytes, parse and report nothing. */
++static bool umi_events_raw;
+ static bool umi_started;
+ /* umi_touch=1: the full driver. False when only umi_touch_fw_info=1 asked. */
+ static bool umi_full;
+@@ -1485,13 +1528,15 @@
+ }
+ 
+ /*
+- * One FTM5 touch event (ftsSoftware.h:273-281, the FTS5 event format):
+- *   event[0]  0x13 enter, 0x23 motion, 0x33 leave
++ * One FTM5 touch event (ftsSoftware.h:273-281 for the ids, stmfts5_report_contact_event
++ * in the mainline FTS5 driver for the bytes):
++ *   event[0]  [7:4] 1 enter, 2 motion, 3 leave; [3:0] major bits 5:4
+  *   event[1]  [7:4] touch id, [3:0] touch type (1 finger, 3 stylus, 5 hover)
+  *   event[2]  x bits 7..0
+  *   event[3]  [3:0] x bits 11..8, [7:4] y bits 3..0
+  *   event[4]  y bits 11..4
+  *   event[5]  pressure, [6]/[7] major/minor -- not needed to move a cursor
++ *   event[7]  [4:0] events still queued behind this one (fts.c:4340-4366)
+  * Coordinates are 12-bit panel pixels (0..1079, 0..2339).
+  */
+ static void
+@@ -1501,7 +1546,7 @@
+ 	uint32_t type = event[1] & FTM5_TOUCH_TYPE_MASK;
+ 	uint32_t x = (((uint32_t)event[3] & 0x0f) << 8) | event[2];
+ 	uint32_t y = ((uint32_t)event[4] << 4) | ((event[3] & 0xf0) >> 4);
+-	bool down = event[0] != FTM5_EVENTID_LEAVE_POINTER;
++	bool down = (event[0] & FTM5_EVENTID_MASK) != FTM5_EVENTID_LEAVE;
+ 
+ 	if (down && type == FTM5_TOUCH_TYPE_HOVER) {
+ 		return;                 /* a hover is not a touch */
+@@ -1546,10 +1591,25 @@
+ 					full = false;
+ 					break;
+ 				}
+-				switch (e[0]) {
+-				case FTM5_EVENTID_ENTER_POINTER:
+-				case FTM5_EVENTID_MOTION_POINTER:
+-				case FTM5_EVENTID_LEAVE_POINTER:
++				/*
++				 * umi_touch_events_raw=1: the eight bytes and nothing
++				 * else -- no parse, no dispatch. The first run on a
++				 * panel should be this one, because the layout is the
++				 * one thing that cannot be checked from the code.
++				 */
++				if (umi_events_raw) {
++					printf("UMI TOUCH: raw %02x %02x %02x %02x "
++					    "%02x %02x %02x %02x (id %02x, queued %u)\n",
++					    e[0], e[1], e[2], e[3], e[4], e[5],
++					    e[6], e[7],
++					    (unsigned)(e[0] & FTM5_EVENTID_MASK),
++					    (unsigned)(e[7] & 0x1f));
++					continue;
++				}
++				switch (e[0] & FTM5_EVENTID_MASK) {
++				case FTM5_EVENTID_ENTER:
++				case FTM5_EVENTID_MOTION:
++				case FTM5_EVENTID_LEAVE:
+ 					parse_event_ftm5(e);
+ 					break;
+ 				default:
+@@ -1757,6 +1817,52 @@
+ }
+ 
+ /*
++ * Wake the analogue front end, tune it, calibrate it, and route the host
++ * interrupt to the pad.
++ *
++ * Each of 0x91/0xa3/0xa4/0xa2 is a one-byte host command -- start, the
++ * address, the command, stop, and no register address -- because that is what
++ * i2c_smbus_write_byte() puts on the wire in the mainline driver, and the
++ * firmware answers each with an event in the FIFO. The waits are the ones in
++ * stmfts5_chip_runtime_resume.
++ */
++static void
++ftm5_wake_calibrate(void)
++{
++	static const struct {
++		uint8_t command;
++		const char *name;
++		uint32_t wait_ms;
++	} steps[] = {
++		{ FTM5_CMD_SLEEP_OUT,    "sleep out",         20 },
++		{ FTM5_CMD_MS_CX_TUNING, "mutual CX tuning",  20 },
++		{ FTM5_CMD_SS_CX_TUNING, "self CX tuning",    20 },
++		{ FTM5_CMD_FORCE_CAL,    "force calibration", 50 },
++	};
++	uint8_t host_int = FTM5_HOST_INT_ENABLE;
++	uint8_t host_int_back = 0;
++	bool ok;
++
++	for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
++		ok = fts_write_bytes(&steps[i].command, 1);
++		printf("UMI TOUCH: FTM5 %s (%02x): %s\n", steps[i].name,
++		    steps[i].command, ok ? "acked" : "not acked");
++		umi_spin_ms(steps[i].wait_ms);
++	}
++	/*
++	 * Host interrupt enable: register 0x002C, value 0x01, written as
++	 * {0xB6, 0x00, 0x2C, 0x01} -- the same four bytes mainline sends
++	 * (int_enable_cmd). Reading it back uses the legacy read shape with its
++	 * dummy byte, so the value is a hint, not a verdict.
++	 */
++	ok = fts_write_registers_u16(FTM5_REG_HOST_INT, &host_int, 1);
++	(void)fts_read_registers_u16(FTM5_REG_HOST_INT, &host_int_back, 1);
++	printf("UMI TOUCH: FTM5 host interrupt 0x%04x <- 0x%02x: %s, read back %02x\n",
++	    FTM5_REG_HOST_INT, host_int, ok ? "acked" : "not acked", host_int_back);
++	umi_spin_ms(5);
++}
++
++/*
+  * ftsCore.c:85 fts_system_reset: the board has a reset gpio, so the vendor
+  * path is a 10 ms low pulse, not a write to ADDR_SYSTEM_RESET; after it the
+  * driver polls for EVT_ID_CONTROLLER_READY (0x03), up to RETRY_SYSTEM_RESET
+@@ -1793,10 +1899,24 @@
+ 	    "(application running)\n", *high, *low, fw[0], fw[1],
+ 	    FTM5_ADDR_DCHIP_FW_VER);
+ 
+-	ok = fts_write_registers(FTM5_ADDR_IER, &ier, 1);
+-	(void)fts_read_registers(FTM5_ADDR_IER, &ier_back, 1);
+-	printf("UMI TOUCH: FTM5 IER 0x%08x <- 0x%02x: %s, read back %02x\n",
+-	    FTM5_ADDR_IER, ier, ok ? "acked" : "not acked", ier_back);
++	/*
++	 * ADDR_IER 0x20000029 <- 0x41 is gone. The vendor FTM5 driver defines
++	 * the register and the value and then writes neither (no reference to
++	 * ADDR_IER in fts.c, fts_proc.c or fts_lib/*.c), and this part answers
++	 * the write with 0x40: bit 0 does not latch, so the read-back that used
++	 * to look like a failure says nothing either way. The interrupt that
++	 * matters is register 0x002C, set in the calibrate block below.
++	 * umi_touch_ier=1 brings the old write back for an A/B.
++	 */
++	if (umi_ier) {
++		ok = fts_write_registers(FTM5_ADDR_IER, &ier, 1);
++		(void)fts_read_registers(FTM5_ADDR_IER, &ier_back, 1);
++		printf("UMI TOUCH: FTM5 IER 0x%08x <- 0x%02x: %s, read back %02x\n",
++		    FTM5_ADDR_IER, ier, ok ? "acked" : "not acked", ier_back);
++	}
++	if (umi_cal) {
++		ftm5_wake_calibrate();
++	}
+ 
+ 	{
+ 		uint8_t scan[3] = { FTM5_CMD_SCAN_MODE, FTM5_SCAN_MODE_ACTIVE,
+@@ -2116,7 +2236,8 @@
+ 	uint32_t ack = 0, scan = 0, mon = 0, proto = 0, clr = 0, pulses = 0;
+ 	uint32_t flash = 0, flash_diag = 0, fw_info = 0, flash_force = 0;
+ 	uint32_t legacy = 0, ev = 0, rdump = 0, burst = FTM5_EVENT_BURST;
+-	uint32_t scanmask = FTM5_SCAN_ACTIVE_ALL;
++	uint32_t cal = 1, ier = 0, raw = 0;
++	uint32_t scanmask = FTM5_SCAN_ACTIVE_MT;
+ 	uint8_t high = 0, low = 0;
+ 	unsigned idle = 0, idle_looks;
+ 	bool found = false;
+@@ -2131,6 +2252,12 @@
+ 	umi_legacy = legacy != 0;
+ 	umi_events = ev != 0;
+ 	umi_reg_dump = rdump != 0;
++	(void)PE_parse_boot_argn("umi_touch_events_raw", &raw, sizeof(raw));
++	(void)PE_parse_boot_argn("umi_touch_cal", &cal, sizeof(cal));
++	(void)PE_parse_boot_argn("umi_touch_ier", &ier, sizeof(ier));
++	umi_events_raw = raw != 0;
++	umi_cal = cal != 0;
++	umi_ier = ier != 0;
+ 	if (burst >= 1 && burst <= FTM5_EVENT_BURST_MAX) {
+ 		events_burst = burst;
+ 	}
