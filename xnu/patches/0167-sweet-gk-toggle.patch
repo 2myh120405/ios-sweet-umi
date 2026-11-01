@@ -1,0 +1,33 @@
+--- a/iokit/Kernel/arm/SweetGK.cpp
++++ b/iokit/Kernel/arm/SweetGK.cpp
+@@ -10,8 +10,9 @@
+  * Method taken from HackiOS (xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp,
+  * APSL 2.0, same XNU lineage as this tree).
+  */
+ #include <IOKit/IOService.h>
++#include <pexpert/pexpert.h>
+ #include <IOKit/IOLib.h>
+ #include <libkern/c++/OSObject.h>
+ 
+ class IOAcceleratorES : public IOService {
+@@ -23,10 +24,20 @@
+ void
+ sweet_publish_accelerator(IOService *provider)
+ {
+ 	IOAcceleratorES *accelerator;
++	uint32_t gk = 1;
+ 
+ 	if (provider == NULL) {
++		return;
++	}
++	/*
++	 * sweetgk=0 publishes nothing at all. CoreAnimation then has no accelerator
++	 * to find and falls back to its software renderer; the experiment tells
++	 * whether the static lock screen is this stub failing it or something else.
++	 */
++	if (PE_parse_boot_argn("sweetgk", &gk, sizeof(gk)) && gk == 0) {
++		IOLog("SWEET GK: publishing disabled by sweetgk=0\n");
+ 		return;
+ 	}
+ 	accelerator = OSTypeAlloc(IOAcceleratorES);
+ 	if (accelerator == NULL || !accelerator->init() || !accelerator->attach(provider)) {
