@@ -1,0 +1,138 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -12,8 +12,9 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_vreg_set(const char *res, unsigned mv, unsigned enable);
++int sweet_rpmh_vreg_set_addr(uint32_t address, unsigned mv, unsigned enable);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+ #define RH_TCS_PA       0x18220d00u
+@@ -413,9 +414,17 @@
+ 		{ "ldoc11", 2950, 3400 },
+ 		{ "ldoc1",  1700, 1900 },
+ 		{ "smpa4",  1700, 1900 },
+ 		{ "smpa5",  1700, 1900 },
+-		{ "ldo13",  2800, 3300 },      /* pm8150_l13: the umi touch analog rail (avdd, 3.0 V) */
++		/*
++		 * pm8150_l13, the umi touch analog rail (avdd, 3.008 V fixed).
++		 * cmd-db does not key regulators by their DT label: rpmh-regulator
++		 * builds "ldo" + the PMIC's qcom,pmic-id + index, and PM8150's id
++		 * is "a", so the key is "ldoa13" (kona-regulators.dtsi spells the
++		 * same thing out as qcom,resource-name = "ldoa13").  "ldo13" is
++		 * not a key in any cmd-db and can only ever return ENODEV.
++		 */
++		{ "ldoa13", 2800, 3300 },
+ 	};
+ 	unsigned lo = 0, hi = 0;
+ 
+ 	if (!res) {
+@@ -458,5 +467,43 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * Raw-address vote for a rail that rpmh knows but cmd-db does not carry under
++ * the name Linux derives.  The cmd-db slot of a VRM resource is assigned by
++ * the boot firmware, not by the PMIC number, so the only way to learn it for a
++ * key that is missing is the sweet_rpmh_dump=1 table.  Once that number is
++ * known, umi_touch_avdd_addr=<addr> places the same voltage/enable/mode vote
++ * without going through rh_lookup(); the address shape check below is the one
++ * rh_lookup() already applies to every cmd-db entry.
++ */
++int
++sweet_rpmh_vreg_set_addr(uint32_t address, unsigned mv, unsigned enable)
++{
++	int error;
++
++	if ((address >> 16) != RH_VRM || (address & 15u) || mv > 4000) {
++		printf("SWEET RPMH: refusing raw VRM address %#x / %u mV\n", address, mv);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	error = EIO;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_send(address, mv, enable);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: raw enable failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/umi_touch.c
++++ b/bsd/dev/umi_touch.c
+@@ -2345,20 +2345,27 @@
+ 	 * power_up() places before it flashes; umi_touch_supply=1 asks for them
+ 	 * on their own.
+ 	 */
+ 	{
+-		uint32_t supply = 0;
++		uint32_t supply = 0, avdd_addr = 0;
+ 
+ 		(void)PE_parse_boot_argn("umi_touch_supply", &supply, sizeof(supply));
+ 		if (supply || flash || flash_diag) {
+ 			extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++			extern int sweet_rpmh_vreg_set_addr(uint32_t address, unsigned mv,
++			    unsigned enable);
+ 
+ 			/*
+ 			 * The four rails the touch node names in the device tree
+ 			 * (arch/arm64/boot/dts/vendor/qcom/kona-mtp.dtsi, st_fts@49):
+ 			 *
+ 			 *   vdd-supply  = <&pm8150a_l1>   1.8 V digital  -> cmd-db "ldoc1"
+-			 *   avdd-supply = <&pm8150_l13>   3.0 V analog   -> cmd-db "ldo13"
++			 *   avdd-supply = <&pm8150_l13>   3.008 V analog -> cmd-db "ldoa13"
++			 *
++			 * The analog key is "ldoa13", not "ldo13": rpmh-regulator
++			 * spells a rail "ldo" + qcom,pmic-id + index, PM8150's id
++			 * is "a", and kona-regulators.dtsi names the same thing
++			 * qcom,resource-name = "ldoa13".  "ldo13" never matched.
+ 			 *
+ 			 * Without avdd the digital side runs - the chip id and the firmware
+ 			 * version read back - but the analog front end is dark, so the part
+ 			 * never produces a coordinate: the FIFO stays empty and INT stays
+@@ -2371,14 +2378,29 @@
+ 			} rails[] = {
+ 				{ "smpa4", 1800 },      /* touch core, first avdd variant */
+ 				{ "smpa5", 1800 },      /* touch core, second avdd variant */
+ 				{ "ldoc1", 1800 },      /* pm8150a_l1: vdd, the digital rail */
+-				{ "ldo13", 3000 },      /* pm8150_l13: avdd, the analog rail */
++				{ "ldoa13", 3008 },     /* pm8150_l13: avdd, fixed 3.008 V */
+ 			};
++
++			/*
++			 * umi_touch_avdd_addr=<cmd-db addr>: only for the case the
++			 * dump shows that ldoa13 was never registered by the boot
++			 * firmware.  The address is not derivable from the PMIC
++			 * number, and 0x4c00 is the SPMI peripheral base, not an
++			 * RPMh address, so it must come out of the dump or not be
++			 * used at all.
++			 */
++			(void)PE_parse_boot_argn("umi_touch_avdd_addr", &avdd_addr, sizeof(avdd_addr));
+ 
+ 			for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+ 				int e = sweet_rpmh_vreg_enable(rails[i].name, rails[i].mv);
+ 
++				if (e && avdd_addr && strcmp(rails[i].name, "ldoa13") == 0) {
++					e = sweet_rpmh_vreg_set_addr(avdd_addr, rails[i].mv, 1);
++					printf("UMI TOUCH: ldoa13 by raw RPMh address %#x -> %d\n",
++					    avdd_addr, e);
++				}
+ 				printf("UMI TOUCH: %s (%u mV) -> %d\n", rails[i].name, rails[i].mv, e);
+ 				umi_spin_ms(10);
+ 			}
+ 			show_pins("rails on");
