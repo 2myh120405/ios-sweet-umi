@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -96,11 +96,62 @@
+@@ -96,8 +96,50 @@
  {
  	return off <= rh_db_size && size <= rh_db_size - off;
  }
@@ -50,6 +50,13 @@
  static int
  rh_map(void)
  {
+ 	if (!rh_rsc) {
+@@ -153,8 +195,17 @@
+ 	/* Linux only checks magic; version 1 is an intentionally stricter policy. */
+ 	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
+ 		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
+ 		return EINVAL;
++	}
 +	{
 +		static bool dumped;
 +		uint32_t dump = 0;
@@ -58,8 +65,7 @@
 +			dumped = true;
 +			sweet_rpmh_dump_entries();
 +		}
-+	}
- 	if (!rh_rsc) {
- 		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
  	}
- 	if (!rh_tcs) {
+ 	return 0;
+ }
+ 
