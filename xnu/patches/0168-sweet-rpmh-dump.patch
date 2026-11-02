@@ -1,0 +1,65 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -96,11 +96,62 @@
+ {
+ 	return off <= rh_db_size && size <= rh_db_size - off;
+ }
+ 
++/*
++ * sweet_rpmh_dump=1: print every cmd-db entry, its 8-byte resource name as the
++ * firmware spells it and the address it resolves to. The device tree names the
++ * touch analog rail pm8150_l13, but cmd-db keys are the names the boot firmware
++ * chose, and "ldo13" is not one of them; this is how we find the right one
++ * instead of guessing.
++ */
++static void
++sweet_rpmh_dump_entries(void)
++{
++	unsigned printed = 0;
++
++	printf("SWEET RPMH: cmd-db entries\n");
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		unsigned count = rh_db16(h + 6);
++
++		if ((entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY)) {
++			continue;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			char name[9];
++
++			for (unsigned k = 0; k < 8; ++k) {
++				name[k] = (char)(rh_read(rh_db, e + k) & 0xffu);
++			}
++			name[8] = 0;
++			printf("SWEET RPMH:   slave %u  %-8s addr=%#x\n",
++			    slave, name, rh_read(rh_db, e + 16));
++			printed++;
++		}
++	}
++	printf("SWEET RPMH: %u entries\n", printed);
++}
++
+ static int
+ rh_map(void)
+ {
++	{
++		static bool dumped;
++		uint32_t dump = 0;
++
++		if (!dumped && PE_parse_boot_argn("sweet_rpmh_dump", &dump, sizeof(dump)) && dump) {
++			dumped = true;
++			sweet_rpmh_dump_entries();
++		}
++	}
+ 	if (!rh_rsc) {
+ 		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
+ 	}
+ 	if (!rh_tcs) {
