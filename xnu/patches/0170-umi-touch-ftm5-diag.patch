@@ -1,0 +1,730 @@
+--- a/bsd/dev/umi_touch.c
++++ b/bsd/dev/umi_touch.c
+@@ -84,6 +84,21 @@
+  *   umi_touch_clear=N      N clock pulses on the bus before each probe (0)
+  *   umi_touch_reset_pulses=N  reset pulses per probe (1, the vendor's order)
+  *
++ * Four more, all off by default; the first three only read:
++ *   umi_touch_crc=1        ADDR_CRC 0x20000078, the 208-byte sysinfo block at
++ *                          framebuffer 0, the events the boot left in the FIFO
++ *                          and the error dump at 0xEF80 -- the vendor's
++ *                          fts_crc_check, readSysInfo and dumpErrorInfo
++ *   umi_touch_regs=A,B     read 32-bit hardware registers, four bytes each, at
++ *                          the addresses named (umi_touch_regs=0x20000078)
++ *   umi_touch_scantest=1   one raw 0x86 read at 8, 16 and 80 bytes, printed
++ *                          whole, with no interrupt and no parsing involved
++ *   umi_touch_seq=1|2      the vendor bring-up (fts_fw_update + fts_init_sensing)
++ *                          instead of the mainline wake block: sysinfo, CRC,
++ *                          panel init when the AFE versions say so, reset,
++ *                          A0 00 01, then A2 03 00 00 00 03. seq=2 forces the
++ *                          full panel init even when the versions agree.
++ *
+  * The flash loader is four more, all off by default; the first three write
+  * nothing to the part ("the flash loader" below has the protocol):
+  *   umi_touch_fw_info=1    print the built-in image's size, checksum and ends
+@@ -188,6 +203,43 @@
+ #define FTM5_EVENTID_MOTION           0x20    /* STMFTS5_EV_MULTI_TOUCH_MOTION */
+ #define FTM5_EVENTID_LEAVE            0x30    /* STMFTS5_EV_MULTI_TOUCH_LEAVE */
+ 
++/* ---- the part's own record of its configuration ------------------------------------------------ */
++
++/*
++ * The vendor never takes the application's word for the configuration: on
++ * every probe fts_fw_update (fts.c:4906) calls fts_crc_check (ftsCore.c:857),
++ * which reads ADDR_CRC (0x20000078) and calls the low two bits (CRC_MASK 0x03)
++ * an error when either is set, and then resets the part and looks in the FIFO
++ * for the error events that name the area: 0x20/0x21 for the config,
++ * 0xa0/0xa1/0xa5/0xa6 for the CX. If a config error is found it reflashes; if
++ * the CX is bad it reloads the panel init data. None of that happens here, so
++ * a run cannot currently tell a bad configuration from a bad driver.
++ *
++ * The reads below are the same ones the vendor makes, and they need two
++ * different framings on the same command byte set: a hardware register is
++ * 0xFA plus a 32-bit address (fts_writeReadU8UX with BITS_32), the system info
++ * and the error dump are 0xA6 (FTS_CMD_FRAMEBUFFER_R) plus a 16-bit address
++ * (BITS_16), both with no dummy byte on I2C. Mixing the two is why nothing in
++ * this driver has ever read the system info.
++ */
++#define FTM5_ADDR_CRC             0x20000078u   /* ADDR_CRC */
++#define FTM5_CRC_MASK             0x03          /* CRC_MASK: bit0 code, bit1 config */
++#define FTM5_CMD_FRAMEBUFFER_R    0xa6          /* FTS_CMD_FRAMEBUFFER_R */
++#define FTM5_CMD_SYSTEM           0xa4          /* FTS_CMD_SYSTEM */
++#define FTM5_CMD_FEATURE          0xa2          /* FTS_CMD_FEATURE */
++#define FTM5_SYS_CMD_SPECIAL      0x00          /* SYS_CMD_SPECIAL */
++#define FTM5_SYS_CMD_LOAD_DATA    0x06          /* SYS_CMD_LOAD_DATA */
++#define FTM5_LOAD_SYS_INFO        0x01          /* LOAD_SYS_INFO */
++#define FTM5_SPECIAL_PANEL_INIT   0x02          /* SPECIAL_PANEL_INIT */
++#define FTM5_SPECIAL_FULL_INIT    0x03          /* SPECIAL_FULL_PANEL_INIT */
++#define FTM5_SYSINFO_SIZE         208           /* SYS_INFO_SIZE, ftsCore.h:50 */
++#define FTM5_HEADER_SIGNATURE     0xa5          /* HEADER_SIGNATURE, ftsCompensation.h */
++#define FTM5_ADDR_ERROR_DUMP      0xef80        /* ADDR_ERROR_DUMP, framebuffer address */
++#define FTM5_ERROR_DUMP_SIZE      128           /* ERROR_DUMP_ROW_SIZE * _COL_SIZE */
++#define FTM5_ERROR_DUMP_SIGNATURE 0xfa5005af    /* first four bytes of a valid dump */
++#define FTM5_STATUS_FRAME_DROP    0x03          /* EVT_TYPE_STATUS_FRAME_DROP */
++#define FTM5_FEAT_SEL_GESTURE     0x03          /* FEAT_SEL_GESTURE */
++
+ /* ---- FTM5 wake, calibrate, host interrupt: what a pin reset does not do ------------------------- */
+ 
+ /*
+@@ -270,6 +322,11 @@
+ static bool umi_ier;
+ /* umi_touch_events_raw=1: print every event's bytes, parse and report nothing. */
+ static bool umi_events_raw;
++/* umi_touch_crc=1, umi_touch_seq=1|2, umi_touch_scantest=1. */
++static bool umi_crc, umi_scantest;
++static uint32_t umi_seq;
++/* umi_touch_regs=A,B: the boot argument string, parsed by ftm5_dump_regs. */
++static char umi_regs[128];
+ static bool umi_started;
+ /* umi_touch=1: the full driver. False when only umi_touch_fw_info=1 asked. */
+ static bool umi_full;
+@@ -954,31 +1011,29 @@
+ }
+ 
+ /*
+- * FTM5 event read: command 0x86 (FIFO_CMD_READALL), repeated start, then
+- * count * FIFO_EVENT_SIZE bytes, no address and no dummy byte
+- * (ftsCore.c:196-207; ftsHardware.h FIFO_CMD_READALL and FIFO_EVENT_SIZE for
+- * I2C_INTERFACE). The answer is min(pending, count) events; an event whose
+- * first byte is 0x00 means the FIFO had nothing more.
++ * One FTM5 FIFO read: command 0x86 (FIFO_CMD_READALL), repeated start, then
++ * length bytes, no address and no dummy byte (ftsCore.c:196-207;
++ * ftsHardware.h FIFO_CMD_READALL and DUMMY_FIFO 0 for I2C_INTERFACE). This is
++ * the whole read fts_event_handler does; the only choice it makes is how many
++ * bytes to ask for, which is why umi_touch_scantest can ask for 80.
+  */
+ static bool
+-fts_read_events_ftm5(uint8_t *events, uint32_t count)
++fts_read_fifo_raw(uint8_t *data, uint32_t length)
+ {
+-	uint32_t total;
+ 	bool ok = false;
+ 
+-	if (count == 0 || count > FTM5_EVENT_BURST_MAX) {
++	if (length == 0) {
+ 		return false;
+ 	}
+-	total = count * FTS_EVENT_SIZE;
+-	memset(events, 0, total);
++	memset(data, 0, length);
+ 	i2c_ack_reset();
+ 	i2c_start();
+ 	if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
+ 	    i2c_write_byte(FTM5_CMD_READ_ALL)) {
+ 		i2c_start();
+ 		if (i2c_write_read_address()) {
+-			for (uint32_t i = 0; i < total; i++) {
+-				events[i] = i2c_read_byte(i + 1 < total);
++			for (uint32_t i = 0; i < length; i++) {
++				data[i] = i2c_read_byte(i + 1 < length);
+ 			}
+ 			ok = true;
+ 		}
+@@ -987,6 +1042,20 @@
+ 	return ok;
+ }
+ 
++/*
++ * count events: FIFO_EVENT_SIZE bytes each, and the answer is min(pending,
++ * count) events. An event whose first byte is 0x00 means the FIFO had nothing
++ * more, which is how every reader here stops.
++ */
++static bool
++fts_read_events_ftm5(uint8_t *events, uint32_t count)
++{
++	if (count == 0 || count > FTM5_EVENT_BURST_MAX) {
++		return false;
++	}
++	return fts_read_fifo_raw(events, count * FTS_EVENT_SIZE);
++}
++
+ /* ---- the flash loader -------------------------------------------------------------------------- */
+ 
+ /*
+@@ -1862,6 +1931,459 @@
+ 	umi_spin_ms(5);
+ }
+ 
++/* ---- the part's configuration, as it reports it: umi_touch_crc and umi_touch_seq ---------------- */
++
++/*
++ * ftsCore.c:85 fts_system_reset: with a reset pin on the board (st,reset-gpio
++ * = tlmm 38) the reset is a 10 ms low pulse, and only a board without one
++ * writes ADDR_SYSTEM_RESET 0x20000024 <- 0x80 instead. Either way the vendor
++ * then polls the FIFO for EVT_ID_CONTROLLER_READY (0x03), 100 ms per attempt
++ * and three attempts.
++ */
++static void
++ftm5_reset_pulse(void)
++{
++	gpio_output(PIN_RESET, false, PULL_NONE, 2);
++	umi_spin_ms(10);
++	gpio_output(PIN_RESET, true, PULL_NONE, 2);
++}
++
++/*
++ * ftsCore.c:499 readSysInfo and ftsError.c:76 dumpErrorInfo: 0xA6, a 16-bit
++ * address, no dummy byte. The same chip takes 0xFA with a 32-bit address for
++ * hardware registers and 0xA6 with a 16-bit one for the two memory windows, so
++ * the framing is per command, not per chip.
++ */
++static bool
++fts_read_framebuffer(uint16_t address, uint8_t *data, uint32_t length)
++{
++	bool ok;
++
++	memset(data, 0, length);
++	i2c_ack_reset();
++	i2c_start();
++	ok = i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
++	    i2c_write_byte(FTM5_CMD_FRAMEBUFFER_R) &&
++	    i2c_write_byte((uint8_t)(address >> 8)) &&
++	    i2c_write_byte((uint8_t)(address & 0xff));
++	if (ok) {
++		i2c_start();
++		if (i2c_write_read_address()) {
++			for (uint32_t i = 0; i < length; i++) {
++				data[i] = i2c_read_byte(i + 1 < length);
++			}
++		} else {
++			ok = false;
++		}
++	}
++	i2c_stop();
++	return ok;
++}
++
++static uint16_t
++ftm5_le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (uint16_t)p[1] << 8);
++}
++
++static uint32_t
++ftm5_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
++	    (uint32_t)p[3] << 24;
++}
++
++/* 16 bytes a line, for the error dump and umi_touch_scantest. */
++static void
++ftm5_hex_dump(const char *what, const uint8_t *data, uint32_t length)
++{
++	for (uint32_t i = 0; i < length; i += 16) {
++		printf("UMI TOUCH: %s %03x:", what, (unsigned)i);
++		for (uint32_t j = 0; j < 16 && i + j < length; j++) {
++			printf(" %02x", data[i + j]);
++		}
++		printf("\n");
++	}
++}
++
++/*
++ * The name of an event, out of ftsSoftware.h. The id is the top nibble of byte
++ * 0 -- the vendor's dispatcher indexes its table with event[0] >> 4 (fts.c:
++ * 4391) -- but 0x03 (CONTROLLER_READY) shares the nibble with 0x00 (NOEVENT),
++ * so the whole byte is checked first. For EVT_ID_ERROR byte 1 is the area that
++ * failed, which is the whole point of reading the FIFO after a reset.
++ */
++static const char *
++ftm5_event_name(const uint8_t *e)
++{
++	switch (e[0]) {
++	case 0x00: return "empty";
++	case FTM5_EVENTID_CONTROLLER_READY: return "controller ready";
++	}
++
++	switch (e[0] & FTM5_EVENTID_MASK) {
++	case 0x10: return "enter";
++	case 0x20: return "motion";
++	case 0x30: return "leave";
++	case 0x40:
++		if (e[1] == FTM5_STATUS_FRAME_DROP) {
++			return "status frame drop";
++		}
++		return "status";
++	case 0x50: return "user report";
++	case 0xe0: return "debug";
++	case 0xf0:
++		switch (e[1]) {
++		case 0x06: return "ERROR watchdog";
++		case 0x20: return "ERROR crc config head";
++		case 0x21: return "ERROR crc config";
++		case 0x22: return "ERROR crc panel head";
++		case 0x23: return "ERROR crc panel";
++		case 0xa0: return "ERROR crc cx head";
++		case 0xa1: return "ERROR crc cx";
++		case 0xa5: return "ERROR crc cx sub head";
++		case 0xa6: return "ERROR crc cx sub";
++		case 0xf0: return "ERROR esd";
++		default: return "ERROR other";
++		}
++	default: return "other";
++	}
++}
++
++static void
++ftm5_print_event(const char *when, const uint8_t *e)
++{
++	printf("UMI TOUCH: %s: event %02x %02x %02x %02x %02x %02x %02x %02x"
++	    " (%s, type %02x, queued %u)\n", when,
++	    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
++	    ftm5_event_name(e), (unsigned)e[1], (unsigned)(e[7] & 0x1f));
++}
++
++/* Read events until the FIFO answers 0x00, printing every one of them. */
++static unsigned
++ftm5_dump_fifo(const char *when)
++{
++	uint8_t e[FTS_EVENT_SIZE];
++	unsigned n = 0;
++
++	for (; n < FTS_FIFO_DEPTH; n++) {
++		if (!fts_read_events_ftm5(e, 1)) {
++			printf("UMI TOUCH: %s: the FIFO read was not acknowledged after %u event(s)\n",
++			    when, n);
++			return n;
++		}
++		if (e[0] == 0x00) {
++			break;
++		}
++		ftm5_print_event(when, e);
++	}
++	if (n == 0) {
++		printf("UMI TOUCH: %s: no events\n", when);
++	}
++	return n;
++}
++
++/*
++ * ftsCore.c:499 readSysInfo: 208 bytes at framebuffer 0, byte 0 the header
++ * signature 0xA5 and byte 1 the data id 0x01, then little-endian fields in the
++ * order readSysInfo parses them. fts_fw_update decides with these whether to
++ * reflash, and whether the panel init data has to be reloaded.
++ */
++static uint8_t ftm5_sysinfo[FTM5_SYSINFO_SIZE];
++static bool ftm5_sysinfo_read;
++
++static bool
++ftm5_sysinfo_load(void)
++{
++	if (ftm5_sysinfo_read) {
++		return ftm5_sysinfo[0] == FTM5_HEADER_SIGNATURE;
++	}
++	ftm5_sysinfo_read = true;
++	if (!fts_read_framebuffer(0, ftm5_sysinfo, sizeof(ftm5_sysinfo))) {
++		printf("UMI TOUCH: sysinfo: framebuffer 0x0000 not acknowledged\n");
++		return false;
++	}
++	if (ftm5_sysinfo[0] != FTM5_HEADER_SIGNATURE ||
++	    ftm5_sysinfo[1] != FTM5_LOAD_SYS_INFO) {
++		printf("UMI TOUCH: sysinfo: header %02x/%02x, expected %02x/%02x: "
++		    "the application has not loaded it\n", ftm5_sysinfo[0],
++		    ftm5_sysinfo[1], FTM5_HEADER_SIGNATURE, FTM5_LOAD_SYS_INFO);
++		return false;
++	}
++	return true;
++}
++
++static void
++ftm5_sysinfo_print(void)
++{
++	const uint8_t *s = ftm5_sysinfo;
++
++	if (!ftm5_sysinfo_load()) {
++		return;
++	}
++	printf("UMI TOUCH: sysinfo: fw %04x svn %04x cfg %04x project %04x cx %04x "
++	    "project %04x\n", ftm5_le16(&s[16]), ftm5_le16(&s[18]),
++	    ftm5_le16(&s[20]), ftm5_le16(&s[22]), ftm5_le16(&s[24]),
++	    ftm5_le16(&s[26]));
++	printf("UMI TOUCH: sysinfo: afe cfg %02x cx %02x panel %02x, protocol %02x, "
++	    "%ux%u, tx %u rx %u key %u force %u\n", s[28], s[29], s[30], s[31],
++	    ftm5_le16(&s[80]), ftm5_le16(&s[82]), s[84], s[85], s[86], s[87]);
++	printf("UMI TOUCH: sysinfo: fw crc %08x cfg crc %08x, release %02x %02x %02x "
++	    "%02x %02x %02x %02x %02x%s\n", ftm5_le32(&s[64]),
++	    ftm5_le32(&s[68]), s[48], s[49], s[50], s[51], s[52], s[53], s[54],
++	    s[55], (s[28] == s[29] && s[28] == s[30]) ? "" :
++	    " -- AFE versions differ: fts_fw_update reloads the panel init");
++}
++
++/*
++ * umi_touch_crc=1: fts_crc_check (ftsCore.c:857), spelled out.
++ *
++ * The register read alone is not the verdict: ADDR_CRC & CRC_MASK names the
++ * area per the CRC_Error enum (1 code, 2 config, 3 cx), and the vendor then
++ * resets and looks in the FIFO for the error events that carry the area. The
++ * second half is the part that cannot be faked by a chip whose application is
++ * only half up, so it is the part worth reading.
++ */
++static void
++ftm5_crc_report(void)
++{
++	uint8_t crc = 0;
++	uint8_t dump[FTM5_ERROR_DUMP_SIZE];
++	bool ready = false;
++
++	if (!fts_read_registers(FTM5_ADDR_CRC, &crc, 1)) {
++		printf("UMI TOUCH: crc: ADDR_CRC 0x%08x not acknowledged\n", FTM5_ADDR_CRC);
++	} else {
++		printf("UMI TOUCH: crc: ADDR_CRC 0x%08x = %02x, status %u of CRC_MASK "
++		    "%02x (none when 0; fts_crc_check calls any non-zero CRC_CODE and "
++		    "tells the areas apart with the boot events)\n", FTM5_ADDR_CRC,
++		    crc, (unsigned)(crc & FTM5_CRC_MASK), FTM5_CRC_MASK);
++	}
++	ftm5_sysinfo_print();
++
++	if (reset_mode == 2) {
++		printf("UMI TOUCH: crc: reset skipped (umi_touch_reset=2): "
++		    "the events the boot left are already gone\n");
++	} else {
++		printf("UMI TOUCH: crc: reset, then the events the application reports at boot\n");
++		ftm5_reset_pulse();
++		for (unsigned i = 0; i < 100 && !ready; i++) {
++			uint8_t e[FTS_EVENT_SIZE];
++
++			if (!fts_read_events_ftm5(e, 1)) {
++				printf("UMI TOUCH: crc: the FIFO read was not acknowledged\n");
++				break;
++			}
++			if (e[0] == 0x00) {
++				umi_spin_ms(2);
++				continue;
++			}
++			ftm5_print_event("crc at boot", e);
++			ready = e[0] == FTM5_EVENTID_CONTROLLER_READY;
++		}
++		if (!ready) {
++			printf("UMI TOUCH: crc: no controller-ready event in 200 ms\n");
++		}
++		(void)ftm5_dump_fifo("crc after boot");
++	}
++
++	if (!fts_read_framebuffer(FTM5_ADDR_ERROR_DUMP, dump, sizeof(dump))) {
++		printf("UMI TOUCH: errdump: framebuffer 0x%04x not acknowledged\n",
++		    FTM5_ADDR_ERROR_DUMP);
++	} else if (ftm5_le32(dump) != FTM5_ERROR_DUMP_SIGNATURE) {
++		printf("UMI TOUCH: errdump: 0x%04x starts %08x, not %08x: nothing dumped\n",
++		    FTM5_ADDR_ERROR_DUMP, ftm5_le32(dump), FTM5_ERROR_DUMP_SIGNATURE);
++	} else {
++		printf("UMI TOUCH: errdump: 0x%04x signature ok\n", FTM5_ADDR_ERROR_DUMP);
++		ftm5_hex_dump("errdump", dump, sizeof(dump));
++	}
++}
++
++/*
++ * umi_touch_scantest=1: the same 0x86 read at three lengths and every byte
++ * printed, zeros included. 8 bytes is what pollForEvent asks for, 16 is two
++ * events, 80 is what a ten-event burst asks for. A chip that answers eight
++ * zeros has an empty FIFO; a chip that does not acknowledge the read address
++ * has nothing to say at all; a chip that answers data has events nobody is
++ * dispatching. The three are told apart here and nowhere else.
++ */
++static void
++ftm5_scan_test(void)
++{
++	static const uint32_t lengths[] = { 8, 16, 80 };
++	uint8_t buf[80];
++
++	for (unsigned l = 0; l < sizeof(lengths) / sizeof(lengths[0]); l++) {
++		uint32_t length = lengths[l];
++		unsigned nonzero = 0;
++		bool ok;
++
++		memset(buf, 0, sizeof(buf));
++		ok = fts_read_fifo_raw(buf, length);
++		for (uint32_t i = 0; ok && i < length; i++) {
++			if (buf[i] != 0) {
++				nonzero++;
++			}
++		}
++		printf("UMI TOUCH: scantest: 0x86 read of %u bytes: %s, %u byte(s) non-zero\n",
++		    (unsigned)length, ok ? "acked" : "NOT acked", nonzero);
++		if (ok) {
++			ftm5_hex_dump("scantest", buf, length);
++			if (nonzero) {
++				ftm5_print_event("scantest", buf);
++			}
++		}
++		umi_spin_ms(20);
++	}
++}
++
++static unsigned
++ftm5_hex_nibble(char c)
++{
++	if (c >= '0' && c <= '9') {
++		return (unsigned)(c - '0');
++	}
++	if (c >= 'a' && c <= 'f') {
++		return (unsigned)(c - 'a' + 10);
++	}
++	if (c >= 'A' && c <= 'F') {
++		return (unsigned)(c - 'A' + 10);
++	}
++	return 16;
++}
++
++/*
++ * umi_touch_regs=0x20000078,0x20000020: four bytes from each 32-bit hardware
++ * register named, through the 0xFA the chip id is read with. Hex, separated by
++ * commas or spaces, up to eight addresses.
++ */
++static void
++ftm5_dump_regs(const char *list)
++{
++	const char *p = list;
++	unsigned n = 0;
++
++	while (*p != '\0' && n < 8) {
++		uint32_t address = 0;
++		uint8_t data[4] = { 0, 0, 0, 0 };
++		unsigned digits = 0;
++
++		while (*p == ',' || *p == ' ') {
++			p++;
++		}
++		if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++			p += 2;
++		}
++		while (ftm5_hex_nibble(*p) < 16) {
++			address = (address << 4) | ftm5_hex_nibble(*p);
++			p++;
++			digits++;
++		}
++		while (*p != '\0' && *p != ',' && *p != ' ') {
++			p++;
++		}
++		if (digits == 0) {
++			break;
++		}
++		if (!fts_read_registers(address, data, sizeof(data))) {
++			printf("UMI TOUCH: regs: 0x%08x: not acknowledged\n", address);
++		} else {
++			printf("UMI TOUCH: regs: 0x%08x: %02x %02x %02x %02x (le %08x)\n",
++			    address, data[0], data[1], data[2], data[3],
++			    ftm5_le32(data));
++		}
++		n++;
++	}
++	if (n == 0) {
++		printf("UMI TOUCH: regs: \"%s\" names no address\n", list);
++	}
++}
++
++/*
++ * umi_touch_seq=1: fts_fw_update (fts.c:4906) and fts_init_sensing
++ * (fts.c:5302) in order, with the mainline wake block left out because the
++ * vendor has no such block at all:
++ *
++ *   1  readSysInfo(0)   0xA6 0x0000, 208 bytes                     ftsCore.c:499
++ *   2  fts_crc_check()  ADDR_CRC, then a reset and the boot events  ftsCore.c:857
++ *   3  init_type        config/cx AFE version differ -> full panel
++ *                       init, config/panel differ -> panel init    fts.c:5019
++ *   4  panel init       reset, A4 00 02|03, then readSysInfo(1)    ftsTest.c:946
++ *   5  a reset          the state fts_init_sensing starts from
++ *   6  A0 00 01         setScanMode(SCAN_MODE_ACTIVE, 0x01)        fts.c:5178
++ *   7  A2 03 00 00 00 03  the FOD gesture feature, sent right after
++ *                       the scan mode in the same path               fts.c:5540
++ *
++ * seq=2 forces the full panel init in step 3, which is the only way to ask for
++ * it when the three AFE versions happen to agree.
++ */
++static bool
++ftm5_vendor_seq(void)
++{
++	uint8_t scan[3] = { FTM5_CMD_SCAN_MODE, FTM5_SCAN_MODE_ACTIVE,
++	    (uint8_t)scan_mode };
++	uint8_t type = 0;
++
++	printf("UMI TOUCH: seq: the vendor bring-up, no mainline wake commands\n");
++	printf("UMI TOUCH: seq: 1) sysinfo\n");
++	ftm5_sysinfo_print();
++
++	if (umi_seq >= 2) {
++		type = FTM5_SPECIAL_FULL_INIT;
++		printf("UMI TOUCH: seq: 3) panel init 03, forced by umi_touch_seq=2\n");
++	} else if (ftm5_sysinfo_load() && ftm5_sysinfo[28] != ftm5_sysinfo[29]) {
++		type = FTM5_SPECIAL_FULL_INIT;
++		printf("UMI TOUCH: seq: 3) panel init 03, cfg afe %02x != cx afe %02x\n",
++		    ftm5_sysinfo[28], ftm5_sysinfo[29]);
++	} else if (ftm5_sysinfo_load() && ftm5_sysinfo[28] != ftm5_sysinfo[30]) {
++		type = FTM5_SPECIAL_PANEL_INIT;
++		printf("UMI TOUCH: seq: 3) panel init 02, cfg afe %02x != panel afe %02x\n",
++		    ftm5_sysinfo[28], ftm5_sysinfo[30]);
++	} else {
++		printf("UMI TOUCH: seq: 3) no panel init: the AFE versions agree\n");
++	}
++
++	if (type != 0) {
++		uint8_t req[3] = { FTM5_CMD_SYSTEM, FTM5_SYS_CMD_SPECIAL, 0 };
++		uint8_t load[3] = { FTM5_CMD_SYSTEM, FTM5_SYS_CMD_LOAD_DATA,
++		    FTM5_LOAD_SYS_INFO };
++
++		req[2] = type;
++		ftm5_reset_pulse();
++		umi_spin_ms(50);
++		(void)ftm5_wait_event(FTM5_EVENTID_CONTROLLER_READY, 200);
++		printf("UMI TOUCH: seq: 4) A4 00 %02x: %s\n", type,
++		    fts_write_bytes(req, sizeof(req)) ? "acked" : "not acked");
++		umi_spin_ms(100);
++		printf("UMI TOUCH: seq: 4) A4 06 01, readSysInfo(1): %s\n",
++		    fts_write_bytes(load, sizeof(load)) ? "acked" : "not acked");
++		umi_spin_ms(50);
++		ftm5_sysinfo_read = false;
++		ftm5_sysinfo_print();
++	}
++
++	printf("UMI TOUCH: seq: 5) reset\n");
++	ftm5_reset_pulse();
++	if (!ftm5_wait_event(FTM5_EVENTID_CONTROLLER_READY, 500)) {
++		printf("UMI TOUCH: seq: no controller ready after the reset\n");
++		return false;
++	}
++	(void)ftm5_dump_fifo("seq after reset");
++	printf("UMI TOUCH: seq: 6) scan mode %02x %02x: %s\n", scan[1], scan[2],
++	    fts_write_bytes(scan, sizeof(scan)) ? "acked" : "not acked");
++	umi_spin_ms(20);
++	{
++		uint8_t gesture[6] = { FTM5_CMD_FEATURE, FTM5_FEAT_SEL_GESTURE,
++			0x00, 0x00, 0x00, 0x03 };
++
++		printf("UMI TOUCH: seq: 7) feature 03, gesture %02x %02x %02x %02x: %s\n",
++		    gesture[2], gesture[3], gesture[4], gesture[5],
++		    fts_write_bytes(gesture, sizeof(gesture)) ? "acked" : "not acked");
++	}
++	umi_spin_ms(20);
++	return true;
++}
++
+ /*
+  * ftsCore.c:85 fts_system_reset: the board has a reset gpio, so the vendor
+  * path is a 10 ms low pulse, not a write to ADDR_SYSTEM_RESET; after it the
+@@ -1883,9 +2405,7 @@
+ 		printf("UMI TOUCH: FTM5 reset skipped (umi_touch_reset=2)\n");
+ 	} else {
+ 		for (unsigned attempt = 0; attempt < 3 && !ready; attempt++) {
+-			gpio_output(PIN_RESET, false, PULL_NONE, 2);
+-			umi_spin_ms(10);
+-			gpio_output(PIN_RESET, true, PULL_NONE, 2);
++			ftm5_reset_pulse();
+ 			ready = ftm5_wait_event(FTM5_EVENTID_CONTROLLER_READY, 500);
+ 			printf("UMI TOUCH: FTM5 reset %u: controller ready %s\n",
+ 			    attempt + 1, ready ? "seen" : "not seen");
+@@ -1900,30 +2420,59 @@
+ 	    FTM5_ADDR_DCHIP_FW_VER);
+ 
+ 	/*
+-	 * ADDR_IER 0x20000029 <- 0x41 is gone. The vendor FTM5 driver defines
+-	 * the register and the value and then writes neither (no reference to
+-	 * ADDR_IER in fts.c, fts_proc.c or fts_lib/*.c), and this part answers
+-	 * the write with 0x40: bit 0 does not latch, so the read-back that used
+-	 * to look like a failure says nothing either way. The interrupt that
+-	 * matters is register 0x002C, set in the calibrate block below.
+-	 * umi_touch_ier=1 brings the old write back for an A/B.
++	 * The vendor's own readings, taken before anything is written to the
++	 * part: the CRC register with the sysinfo block and the events the boot
++	 * left in the FIFO (umi_touch_crc), and any register named on the
++	 * command line (umi_touch_regs). Both only read.
+ 	 */
+-	if (umi_ier) {
+-		ok = fts_write_registers(FTM5_ADDR_IER, &ier, 1);
+-		(void)fts_read_registers(FTM5_ADDR_IER, &ier_back, 1);
+-		printf("UMI TOUCH: FTM5 IER 0x%08x <- 0x%02x: %s, read back %02x\n",
+-		    FTM5_ADDR_IER, ier, ok ? "acked" : "not acked", ier_back);
++	if (umi_crc) {
++		ftm5_crc_report();
+ 	}
+-	if (umi_cal) {
+-		ftm5_wake_calibrate();
++	if (umi_regs[0] != '\0') {
++		ftm5_dump_regs(umi_regs);
+ 	}
+ 
+-	{
+-		uint8_t scan[3] = { FTM5_CMD_SCAN_MODE, FTM5_SCAN_MODE_ACTIVE,
+-		    (uint8_t)scan_mode };
++	/*
++	 * Two bring-ups: the mainline one below (a reset pulse, four one-byte
++	 * host commands, a legacy register write and A0 00 01) and, with
++	 * umi_touch_seq=1, the vendor's own (reset, sysinfo, CRC, panel init,
++	 * A0 00 01, A2 03 00 00 00 03) with none of the mainline commands in
++	 * it. They are mutually exclusive because the mainline block is what
++	 * the vendor's 4.9 driver does not have and what the FIFO went silent
++	 * after in the first log that had it.
++	 */
++	if (umi_seq) {
++		if (!ftm5_vendor_seq()) {
++			return false;
++		}
++	} else {
++		/*
++		 * ADDR_IER 0x20000029 <- 0x41 is gone. The vendor FTM5 driver
++		 * defines the register and the value and then writes neither (no
++		 * reference to ADDR_IER in fts.c, fts_proc.c or fts_lib/*.c),
++		 * and this part answers the write with 0x40: bit 0 does not
++		 * latch, so the read-back that used to look like a failure says
++		 * nothing either way. The interrupt that matters is register
++		 * 0x002C, set in the calibrate block below. umi_touch_ier=1
++		 * brings the old write back for an A/B.
++		 */
++		if (umi_ier) {
++			ok = fts_write_registers(FTM5_ADDR_IER, &ier, 1);
++			(void)fts_read_registers(FTM5_ADDR_IER, &ier_back, 1);
++			printf("UMI TOUCH: FTM5 IER 0x%08x <- 0x%02x: %s, read back %02x\n",
++			    FTM5_ADDR_IER, ier, ok ? "acked" : "not acked", ier_back);
++		}
++		if (umi_cal) {
++			ftm5_wake_calibrate();
++		}
++
++		{
++			uint8_t scan[3] = { FTM5_CMD_SCAN_MODE, FTM5_SCAN_MODE_ACTIVE,
++			    (uint8_t)scan_mode };
+ 
+-		printf("UMI TOUCH: FTM5 scan mode %02x %02x: %s\n", scan[1], scan[2],
+-		    fts_write_bytes(scan, sizeof(scan)) ? "acked" : "not acked");
++			printf("UMI TOUCH: FTM5 scan mode %02x %02x: %s\n", scan[1], scan[2],
++			    fts_write_bytes(scan, sizeof(scan)) ? "acked" : "not acked");
++		}
+ 	}
+ 	/* Whatever the reset left in the FIFO is not a finger. */
+ 	for (unsigned i = 0; i < FTS_FIFO_DEPTH; i++) {
+@@ -1935,6 +2484,9 @@
+ 		}
+ 	}
+ 	umi_spin_ms(20);
++	if (umi_scantest) {
++		ftm5_scan_test();
++	}
+ 	return true;
+ }
+ 
+@@ -2237,6 +2789,7 @@
+ 	uint32_t flash = 0, flash_diag = 0, fw_info = 0, flash_force = 0;
+ 	uint32_t legacy = 0, ev = 0, rdump = 0, burst = FTM5_EVENT_BURST;
+ 	uint32_t cal = 1, ier = 0, raw = 0;
++	uint32_t crc = 0, seq = 0, scantest = 0;
+ 	uint32_t scanmask = FTM5_SCAN_ACTIVE_MT;
+ 	uint8_t high = 0, low = 0;
+ 	unsigned idle = 0, idle_looks;
+@@ -2258,6 +2811,18 @@
+ 	umi_events_raw = raw != 0;
+ 	umi_cal = cal != 0;
+ 	umi_ier = ier != 0;
++	/*
++	 * umi_touch_crc=1, umi_touch_seq=1|2, umi_touch_scantest=1 and
++	 * umi_touch_regs=<list>. The register list is the one argument that is
++	 * not a number, so it is read as a string.
++	 */
++	(void)PE_parse_boot_argn("umi_touch_crc", &crc, sizeof(crc));
++	(void)PE_parse_boot_argn("umi_touch_seq", &seq, sizeof(seq));
++	(void)PE_parse_boot_argn("umi_touch_scantest", &scantest, sizeof(scantest));
++	umi_crc = crc != 0;
++	umi_scantest = scantest != 0;
++	umi_seq = seq > 2 ? 1 : seq;
++	(void)PE_parse_boot_arg_str("umi_touch_regs", umi_regs, sizeof(umi_regs));
+ 	if (burst >= 1 && burst <= FTM5_EVENT_BURST_MAX) {
+ 		events_burst = burst;
+ 	}
