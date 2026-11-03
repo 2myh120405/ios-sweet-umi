@@ -1,0 +1,154 @@
+0174 — kernel review fixes (chainE, applies after 0158,0160..0173), review of 2026-11-03
+
+只修 bug，不改行为语义。对应报告 E:/dsh/reports/kernel-review-2026-11-03.md 的
+M3 / M4 / M5 / L1 / L2 五条（高严重度的 H1 与 panic 路径 M1 需要真机 A/B 或会改变失败时的
+行为，故意不在本补丁里）。应用：
+  cd work/chainE && patch -p1 --fuzz=0 < work/patches/0174-kernel-review-fixes.patch
+
+验证：patch(1) 在此树三份原文件上 --fuzz=0 全部干净应用（8 hunk），应用结果与本补丁生成的
+b/ 版本逐字节相同，无 .rej/.orig；三个文件 '{'-'}' 计数与打补丁前一致（没有括号错位）。
+未做编译（本机没有 WSL clang-15 那套 SDK 路径）；按 work/cc-u16.sh 的参数在 CI 上过一遍
+-fsyntax-only 再上机更稳妥。
+
+本段说明写在第一个 "---" 之前，patch(1) 会忽略它；hunk 内的注释随代码一起加。
+未改任何默认值、boot-arg、时序或日志文案（fb 那处把死代码里本来就有的 IOLog 恢复成主路径）。
+
+[H1] bsd/dev/umi_touch.c:2139 和 :2151 — 报告 L1（ftm5_sysinfo_load 缓存失败）
+  依据：ftm5_sysinfo_read 在“读之前”置位。fts_read_framebuffer 失败、或 header 不是
+  a5/01 时该标志仍为 true，于是本次开机以后每次 ftm5_sysinfo_load() 都只返回缓存结论
+  ftm5_sysinfo[0]==a5，不再重读；ftm5_vendor_seq() 的 panel-init 判据（2667/2671）和
+  ftm5_sysinfo_print() 就静默失效。改为校验通过后才置位：成功路径逐字不变，失败路径从
+  “永久失败”变成“下次再试”。两个 hunk 是同一个改动的删行/加行。
+
+[H2] bsd/dev/umi_touch.c:3344 — 报告 M3（pcycle/fa 被嵌在 supply 的 if 里，闭合）
+  依据：0161-umi-touch-pcycle.patch 把 umi_touch_pcycle 块插在
+  `if (supply || flash || flash_diag) { ... }` 的两个右括号之前，0163 又把
+  umi_touch_fa 块插在同一位置，于是两个块都成了那个 if 的子语句：
+  `umi_touch=1 umi_touch_pcycle=1`（不带 umi_touch_supply/flash）时整块不执行，
+  而 pcycle 正是“清掉上次启动遗留的半字节状态、把 smpa4 关掉再上”的唯一手段，
+  且它自己就投 smpa4 的票，并不依赖前一段。此处把该 if 就地闭合，让 fa / pcycle 回到
+  与 umi_touch_avdd 同级（都在最外层匿名块内、两处缩进本来就是按这个层级写的）。
+
+[H3] bsd/dev/umi_touch.c:3381 — 报告 M3 同一处（删掉重复的右括号）
+  依据：那个 if 的右括号原来在 pcycle 块之后（2 个 tab 的那一行），H2 已经补了一份，
+  这里删掉重复的一份；最外层块的右括号保留。括号总数不变（校验：两版 '{'-'}' 都是 0）。
+
+[H4] iokit/Kernel/arm/SweetFramebuffer.cpp:649 — 报告 M4（死代码 + 缺 scalarInputCount 校验）
+  依据：0173-fb-vsync-diag.patch 把 `case kSweetFBNotifications:` 改写成
+  `case kSweetFBNotifications: { ... break; }`，却把原实现（带
+  `args->scalarInputCount >= 3` 检查、fLock、IOLog 的那段）留在了新块之后，成为不可达
+  死代码（0173 的 hunk 里可以看到 `+	}` 后面紧跟未改动的
+  `if (args->scalarInputCount >= 3 ...`）。于是现役路径 (a) 不查 scalarInputCount 就读
+  scalarInput[0..2]——客户端少传标量时读到 NULL/越界；(b) fFunc/fRefcon 不再持 fLock，
+  而 vsyncFired 是在锁内读它们。这里删死代码、把检查与锁移进现役块，日志沿用死代码里
+  那一行（"<proc> notifications type %u on|off"），并保留 outCount = 0。
+
+[H5] bsd/dev/sweet_ufs.c:338 — 报告 M5（GPT nent*esz 32 位溢出）
+  依据：nent 来自 GPT 头（磁盘值），`nent * esz` 在 32 位里回绕：nent=0x2000001、esz=128
+  时乘积截断为 0x80，通过 `> BOUNCE_SIZE` 检查；随后 `for (i<nent) e = b + i*128` 会走到
+  64 KiB bounce buffer 之外。改成 64 位乘法即把 nent 限在 512 以内，循环和后面的
+  `(nent*esz + 4095)/4096` 也随之安全（该值 <= 65536/4096 = 16，仍在
+  ufs_read_blocks 的 count 上限内）。
+
+[H6] bsd/dev/sweet_ufs.c:917 — 报告 L2（磁盘上的日志头 size 没做下限/对齐校验）
+  依据：sweet_log_header 是从磁盘读回来的。原判据只挡 size==0 和 size>4MiB，于是
+  `h->size / UFS_BLOCK` 可能为 0（size<4096 而 size 非 0），下一行
+  `% (h->size / UFS_BLOCK)` 就是除零（AArch64 的 UDIV 序列返回 0、不 trap，但会去读错块）；
+  size 不是块整数倍时块号也算错。加上 `>= UFS_BLOCK` 与块对齐判据，效果只是把
+  “读到错数据”变成“当作没有上一轮日志”，不影响正常写入路径（写入侧 size 恒为 4 MiB）。
+--- a/bsd/dev/umi_touch.c	2026-11-03 22:07:18.841107000 +0800
++++ b/bsd/dev/umi_touch.c	2026-11-03 22:07:19.138105900 +0800
+@@ -2139,7 +2139,6 @@
+ 	if (ftm5_sysinfo_read) {
+ 		return ftm5_sysinfo[0] == FTM5_HEADER_SIGNATURE;
+ 	}
+-	ftm5_sysinfo_read = true;
+ 	if (!fts_read_framebuffer(0, ftm5_sysinfo, sizeof(ftm5_sysinfo))) {
+ 		printf("UMI TOUCH: sysinfo: framebuffer 0x0000 not acknowledged\n");
+ 		return false;
+@@ -2151,6 +2150,7 @@
+ 		    ftm5_sysinfo[1], FTM5_HEADER_SIGNATURE, FTM5_LOAD_SYS_INFO);
+ 		return false;
+ 	}
++	ftm5_sysinfo_read = true;
+ 	return true;
+ }
+ 
+@@ -3344,6 +3344,7 @@
+ 				umi_spin_ms(10);
+ 			}
+ 			show_pins("rails on");
++		}
+ 
+ 	{
+ 		uint32_t fa = 0;
+@@ -3380,7 +3381,6 @@
+ 		umi_spin_ms(settle_ms);
+ 		show_pins("after pcycle");
+ 	}
+-		}
+ 	}
+ 
+ 	if (swap) {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 22:07:19.033103000 +0800
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 22:07:19.140106200 +0800
+@@ -649,21 +649,12 @@
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBNotifications: {
+-		uint32_t func = (uint32_t)args->scalarInput[0];
+-		uint32_t refcon = (uint32_t)args->scalarInput[1];
+-		uint32_t type = (uint32_t)args->scalarInput[2];
+-
+-		printf("SWEET FB: notifications type=%u func=%#x refcon=%#x port=%s\n",
+-		    type, func, refcon, fPort == MACH_PORT_NULL ? "null" : "set");
+-		if (type < SWEET_FB_NOTIFY_TYPES) {
+-			fFunc[type] = func;
+-			fRefcon[type] = refcon;
+-		}
+-		outCount = 0;
+-		break;
+-	}
+-		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
++		/* 0173 removed the scalarInputCount check from this path and left the
++		 * checked body behind as dead code: read only what the caller sent. */
++		if (args->scalarInputCount >= 3 &&
++		    args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];
++
+ 			IOLockLock(fFB->fLock);
+ 			fFunc[type] = args->scalarInput[0];
+ 			fRefcon[type] = args->scalarInput[1];
+@@ -673,7 +664,9 @@
+ 			IOLog("SWEET FB: %s notifications type %u %s\n", name, type,
+ 			    args->scalarInput[0] ? "on" : "off");
+ 		}
++		outCount = 0;
+ 		break;
++	}
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+--- a/bsd/dev/sweet_ufs.c	2026-11-03 22:07:18.944101700 +0800
++++ b/bsd/dev/sweet_ufs.c	2026-11-03 22:07:19.141106300 +0800
+@@ -335,7 +335,7 @@
+ 	memcpy(&entry_lba, b + 72, 8);
+ 	memcpy(&nent, b + 80, 4);
+ 	memcpy(&esz, b + 84, 4);
+-	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++	if (esz != 128 || nent == 0 || (uint64_t)nent * esz > BOUNCE_SIZE) {
+ 		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+ 		return ENXIO;
+ 	}
+@@ -914,8 +914,9 @@
+ 	if (!su.writable || ufs_read_blocks(base, 1)) {
+ 		return;
+ 	}
+-	if (h->magic[0] != 'S' || h->magic[7] != 'G' || h->size == 0 ||
+-	    h->size > SWEET_LOG_SIZE || h->total == 0) {
++	if (h->magic[0] != 'S' || h->magic[7] != 'G' ||
++	    h->size < UFS_BLOCK || h->size > SWEET_LOG_SIZE ||
++	    (h->size % UFS_BLOCK) != 0 || h->total == 0) {
+ 		return;
+ 	}
+ 	uint64_t last = (h->total - 1) / UFS_BLOCK % (h->size / UFS_BLOCK);
