@@ -1,0 +1,80 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -155,8 +155,11 @@
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++static bool fbNotifyDiag;
++static uint64_t fbNotifySent, fbNotifyDropped;
++
+ static void
+ sweet_set_number(OSDictionary *d, const char *key, uint64_t value)
+ {
+ 	OSNumber *n = OSNumber::withNumber(value, 32);
+@@ -228,8 +231,16 @@
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+ 	PE_Video video;
++	{
++		uint32_t diag = 0;
++
++		if (PE_parse_boot_argn("sweetfb_notify_diag", &diag, sizeof(diag)) && diag) {
++			fbNotifyDiag = true;
++		}
++		printf("SWEET FB: notify diag %s\n", fbNotifyDiag ? "on" : "off");
++	}
+ 
+ 	printf("SWEET FB: AppleCLCD::start entered\n");
+ 
+ 	if (!IOService::start(provider)) {
+@@ -563,9 +574,24 @@
+ {
+ 	OSAsyncReference64 ref;
+ 
+ 	if (type >= SWEET_FB_NOTIFY_TYPES || fFunc[type] == 0 || fPort == MACH_PORT_NULL) {
++		/*
++		 * sweetfb_notify_diag=1: say why a notification is dropped. CoreAnimation
++		 * only receives vsyncs once it has registered a function for the type and
++		 * a port; without the diagnosis a silent drop here looks exactly like the
++		 * display link never running.
++		 */
++		if (fbNotifyDiag && (fbNotifyDropped++ % 120) == 0) {
++			printf("SWEET FB: vsync drop #%llu type=%u func=%d port=%s\n",
++			    fbNotifyDropped, type, fFunc[type] != 0,
++			    fPort == MACH_PORT_NULL ? "null" : "set");
++		}
+ 		return;
++	}
++	if (fbNotifyDiag && (fbNotifySent++ % 120) == 1) {
++		printf("SWEET FB: vsync notify #%llu sent type=%u values=%llu/%llu/%llu\n",
++		    fbNotifySent, type, values[0], values[2], values[4]);
+ 	}
+ 	bzero(ref, sizeof(ref));
+ 	setAsyncReference64(ref, fPort, (mach_vm_address_t)fFunc[type], fRefcon[type], fTask);
+ 	sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
+@@ -621,9 +647,22 @@
+ 	case kSweetFBGetDotPitch:
+ 		out[0] = SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
+-	case kSweetFBNotifications:
++	case kSweetFBNotifications: {
++		uint32_t func = (uint32_t)args->scalarInput[0];
++		uint32_t refcon = (uint32_t)args->scalarInput[1];
++		uint32_t type = (uint32_t)args->scalarInput[2];
++
++		printf("SWEET FB: notifications type=%u func=%#x refcon=%#x port=%s\n",
++		    type, func, refcon, fPort == MACH_PORT_NULL ? "null" : "set");
++		if (type < SWEET_FB_NOTIFY_TYPES) {
++			fFunc[type] = func;
++			fRefcon[type] = refcon;
++		}
++		outCount = 0;
++		break;
++	}
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];
+ 			IOLockLock(fFB->fLock);
+ 			fFunc[type] = args->scalarInput[0];
