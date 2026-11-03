@@ -1,0 +1,459 @@
+--- a/bsd/dev/umi_touch.c
++++ b/bsd/dev/umi_touch.c
+@@ -99,6 +99,20 @@
+  *                          A0 00 01, then A2 03 00 00 00 03. seq=2 forces the
+  *                          full panel init even when the versions agree.
+  *
++ * Three more, all off by default; none of them writes the part:
++ *   umi_touch_ref=1        the reference implementation's own startup
++ *                          (ios-sweet-umi v6, UmiFtsTouch.cpp) instead of the
++ *                          blocks above: three GPIO resets, each with its own
++ *                          READY event inside 100 ms; the 13-by-16-byte
++ *                          sysinfo read; ADDR_CRC; the lockdown identity
++ *                          record; then sensing and single-event reads. Every
++ *                          step and its acknowledge is printed.
++ *   umi_touch_sysinfo_chunked=1  the same 208 bytes read as 13 chunks of 16
++ *                          with a framing address each, and compared byte for
++ *                          byte with the one 208-byte read
++ *   umi_touch_event_single=1  one 8-byte event per 0x86 read instead of
++ *                          umi_touch_events_burst (10)
++ *
+  * The flash loader is four more, all off by default; the first three write
+  * nothing to the part ("the flash loader" below has the protocol):
+  *   umi_touch_fw_info=1    print the built-in image's size, checksum and ends
+@@ -240,6 +254,27 @@
+ #define FTM5_STATUS_FRAME_DROP    0x03          /* EVT_TYPE_STATUS_FRAME_DROP */
+ #define FTM5_FEAT_SEL_GESTURE     0x03          /* FEAT_SEL_GESTURE */
+ 
++/*
++ * The reference's startup reads the system information the way the native
++ * driver does, and reads one more factory record. The block is 208 bytes and
++ * the native reader takes it 16 bytes at a time with an address for each
++ * chunk, so 13 chunks and a 13-bit mask are the whole of it
++ * (UmiFtsStartup.h:11 tests chunkMask == 0x1fff). The lockdown record is the
++ * same framebuffer with data id 0x70: a four-byte head whose counter must
++ * advance by one per load, and eight identity bytes at offset 20
++ * (UmiFtsIdentity.h:14-41).
++ */
++#define FTM5_SYSINFO_CHUNK        16            /* chunk size of the native read */
++#define FTM5_SYSINFO_CHUNKS       (FTM5_SYSINFO_SIZE / FTM5_SYSINFO_CHUNK)
++#define FTM5_LOAD_LOCKDOWN        0x70          /* LOAD_LOCKDOWN_INFO */
++#define FTM5_LOCKDOWN_DATA_OFFSET 20            /* LOCKDOWN_DATA_OFFSET */
++#define FTM5_LOCKDOWN_SIZE        8             /* LOCKDOWN_SIZE */
++#define FTM5_EVT_STATUS_ECHO      0x01          /* EVT_STATUS_ECHO: 0x43 01 cmd */
++#define FTM5_REF_READY_MS         100           /* GENERAL_TIMEOUT, ftsTime.h:31 */
++#define FTM5_REF_POLL_MS          2             /* TIMEOUT_RESOLUTION */
++#define FTM5_REF_READY_POLLS      (FTM5_REF_READY_MS / FTM5_REF_POLL_MS)
++#define FTM5_REF_ECHO_POLLS       50            /* UmiFtsIdentity.h:24 */
++
+ /* ---- FTM5 wake, calibrate, host interrupt: what a pin reset does not do ------------------------- */
+ 
+ /*
+@@ -325,6 +360,8 @@
+ /* umi_touch_crc=1, umi_touch_seq=1|2, umi_touch_scantest=1. */
+ static bool umi_crc, umi_scantest;
+ static uint32_t umi_seq;
++/* umi_touch_ref=1, umi_touch_sysinfo_chunked=1, umi_touch_event_single=1. */
++static bool umi_ref, umi_sysinfo_chunked, umi_event_single;
+ /* umi_touch_regs=A,B: the boot argument string, parsed by ftm5_dump_regs. */
+ static char umi_regs[128];
+ static bool umi_started;
+@@ -2242,6 +2279,297 @@
+ 	}
+ }
+ 
++/* ---- the reference implementation's own bring-up: umi_touch_ref=1 ------------------------------- */
++
++/*
++ * What ios-sweet-umi v6 does, in the order it does it (kernel units/UmiFtsTouch,
++ * UmiFtsTouch.cpp; line numbers below are that file's):
++ *
++ *   1  GPIO reset, then poll the FIFO eight bytes at a time for
++ *      EVT_ID_CONTROLLER_READY (0x03) inside 100 ms, one poll every 2 ms
++ *      (lines 536-573 with UmiFtsStartup.h:41-49: GENERAL_TIMEOUT 100 ms,
++ *      TIMEOUT_RESOLUTION 2 ms, ftsTime.h:30-31). A NACK inside that window is
++ *      not a failure -- the application is still starting -- and any byte that
++ *      is neither 0x03 nor 0xf3 is simply not a contact yet
++ *      (UmiFtsStartup.h:44-52).
++ *   2  readSysInfo as 13 chunks of 16 bytes, each through its own 0xA6 with a
++ *      16-bit framebuffer address; chunkMask 0x1fff is the complete block
++ *      (UmiFtsStartup.h:11).
++ *   3  ADDR_CRC, and crc & 3 == 0 is the verdict (UmiFtsStartup.h:13-14).
++ *   4  fts_get_lockdown_info: 0xA6 0x0000 read four bytes (0xa5, 0x70, a
++ *      counter), 0xA4 06 70, poll for the 0x43 01 a4 06 70 echo, then 0xA6
++ *      0x0000 read 28 bytes: header, counter + 1, and the identity at 20..27
++ *      (UmiFtsIdentity.h:14-41). Read-only: zero NVM writes.
++ *   5  two more GPIO resets, each with its own READY (lines 627-633: "READY #1
++ *      -> CRC-check reset; READY #2 -> post-version reset"). Three READY
++ *      events before sensing is the reference's own count (line 243).
++ *   6  sensing (fts_init_sensing: sense off, WAIT_AFTER_SENSEOFF 50 ms, sense
++ *      on, then the FOD gesture command, fts.c:5302-5314 and 5535-5540), then
++ *      one event per 0x86 read (lines 536-651 read eight bytes per pass and
++ *      stop when event[7] & 31 says the FIFO has nothing queued).
++ *
++ * The reference would stop at a failed identity check (line 610, stop(20));
++ * this path is a probe that has to reach the event loop, so it prints the same
++ * verdict and carries on. Nothing here writes the part.
++ */
++static bool
++ftm5_ref_ready(const char *when, unsigned number)
++{
++	uint8_t event[FTS_EVENT_SIZE];
++	unsigned polls = 0, nacks = 0, other = 0, printed = 0;
++
++	for (; polls < FTM5_REF_READY_POLLS; polls++) {
++		if (!fts_read_events_ftm5(event, 1)) {
++			nacks++;
++		} else if (event[0] == FTM5_EVENTID_CONTROLLER_READY) {
++			printf("UMI TOUCH: ref reset %u (%s): READY after %u poll(s), "
++			    "~%u ms, %u NACK(s), %u other event(s), int %s\n",
++			    number, when, polls + 1, (polls + 1) * FTM5_REF_POLL_MS,
++			    nacks, other, gpio_get(PIN_INT) ? "high" : "low");
++			return true;
++		} else if (event[0] != EVENTID_NO_EVENT) {
++			other++;
++			if (printed++ < 4) {
++				ftm5_print_event("ref reset", event);
++			}
++		}
++		umi_sleep_us(FTM5_REF_POLL_MS * 1000);
++	}
++	printf("UMI TOUCH: ref reset %u (%s): no READY in %u ms (%u poll(s), "
++	    "%u NACK, %u other event(s)), int %s\n", number, when,
++	    FTM5_REF_READY_MS, polls, nacks, other,
++	    gpio_get(PIN_INT) ? "high" : "low");
++	return false;
++}
++
++/*
++ * umi_touch_sysinfo_chunked=1: the same 208 bytes twice, once as the native
++ * reader takes them (13 chunks of 16, a retry per chunk, the chunkMask the
++ * reference tests) and once as this driver has always taken them (one 0xA6
++ * 0x0000 and 208 bytes back), then compared byte for byte. This is the
++ * measurement that says whether the long read on this part returns the block
++ * the chip holds. The four fields worth reading are printed both ways.
++ */
++static void
++ftm5_sysinfo_chunked_check(void)
++{
++	uint8_t chunked[FTM5_SYSINFO_SIZE];
++	uint8_t whole[FTM5_SYSINFO_SIZE];
++	uint32_t mask = 0, differ = 0, first = 0;
++	bool whole_ok;
++
++	memset(chunked, 0, sizeof(chunked));
++	memset(whole, 0, sizeof(whole));
++	for (uint32_t chunk = 0; chunk < FTM5_SYSINFO_CHUNKS; chunk++) {
++		uint16_t address = (uint16_t)(chunk * FTM5_SYSINFO_CHUNK);
++		bool ok = false;
++
++		for (unsigned retry = 0; retry < 3 && !ok; retry++) {
++			ok = fts_read_framebuffer(address, &chunked[address],
++			    FTM5_SYSINFO_CHUNK);
++			if (!ok) {
++				umi_spin_ms(2);
++			}
++		}
++		if (ok) {
++			mask |= 1u << chunk;
++		} else {
++			printf("UMI TOUCH: syschunk: chunk %u at 0x%04x not acknowledged\n",
++			    chunk, (unsigned)address);
++		}
++	}
++	whole_ok = fts_read_framebuffer(0, whole, sizeof(whole));
++	printf("UMI TOUCH: syschunk: %u chunks of %u bytes, chunkMask %#x "
++	    "(0x1fff is the complete block), headers %02x %02x / %02x %02x, "
++	    "whole read %s\n", FTM5_SYSINFO_CHUNKS, FTM5_SYSINFO_CHUNK, mask,
++	    chunked[0], chunked[1], whole[0], whole[1],
++	    whole_ok ? "acked" : "NOT acked");
++	printf("UMI TOUCH: syschunk: chunked fw %04x cfg %04x cx %04x afe %02x "
++	    "%02x %02x %ux%u; whole fw %04x cfg %04x cx %04x afe %02x %02x %02x "
++	    "%ux%u\n", ftm5_le16(&chunked[16]), ftm5_le16(&chunked[20]),
++	    ftm5_le16(&chunked[24]), chunked[28], chunked[29], chunked[30],
++	    ftm5_le16(&chunked[80]), ftm5_le16(&chunked[82]),
++	    ftm5_le16(&whole[16]), ftm5_le16(&whole[20]), ftm5_le16(&whole[24]),
++	    whole[28], whole[29], whole[30], ftm5_le16(&whole[80]),
++	    ftm5_le16(&whole[82]));
++	for (uint32_t i = 0; i < FTM5_SYSINFO_SIZE; i++) {
++		if (chunked[i] != whole[i]) {
++			if (differ == 0) {
++				first = i;
++			}
++			differ++;
++		}
++	}
++	if (differ == 0) {
++		printf("UMI TOUCH: syschunk: the %u bytes agree byte for byte: "
++		    "the long read returns the block the chip holds\n",
++		    (unsigned)FTM5_SYSINFO_SIZE);
++	} else {
++		printf("UMI TOUCH: syschunk: %u byte(s) differ, first at 0x%03x\n",
++		    differ, first);
++		ftm5_hex_dump("syschunk whole", whole, 48);
++		ftm5_hex_dump("syschunk chunk", chunked, 48);
++	}
++}
++
++/*
++ * UmiFtsIdentity.h:14-41, printed with the reference's own result numbers so a
++ * log can be read against its source. The identity itself is a factory record
++ * (the module's own serial); the reference compares it with the two qualified
++ * umi modules and refuses to sense on anything else. This only reads.
++ */
++static void
++ftm5_ref_identity(void)
++{
++	static const uint8_t expected[FTM5_LOCKDOWN_SIZE] = {
++		0x53, 0x42, 0x32, 0x01, 0x74, 0x02, 0x32, 0x01
++	};
++	const uint8_t request[3] = {
++		FTM5_CMD_SYSTEM, FTM5_SYS_CMD_LOAD_DATA, FTM5_LOAD_LOCKDOWN
++	};
++	uint8_t before[4] = { 0, 0, 0, 0 };
++	uint8_t after[FTM5_LOCKDOWN_DATA_OFFSET + FTM5_LOCKDOWN_SIZE];
++	uint8_t event[FTS_EVENT_SIZE];
++	unsigned before_count = 0, after_count = 0, polls = 0, echo = 0;
++	unsigned matched = 0, result = 0;
++
++	memset(after, 0, sizeof(after));
++	if (!fts_read_framebuffer(0, before, sizeof(before))) {
++		result = 1;
++	} else if (before[0] != FTM5_HEADER_SIGNATURE) {
++		result = 2;
++	}
++	printf("UMI TOUCH: ref identity: framebuffer 0x0000 head %02x %02x "
++	    "counter %u (%s)\n", before[0], before[1],
++	    before[2] | (before[3] << 8),
++	    result == 1 ? "not acknowledged" : result == 2 ? "not 0xa5" : "ok");
++	if (result == 0) {
++		before_count = before[2] | (before[3] << 8);
++		if (!fts_write_bytes(request, sizeof(request))) {
++			result = 3;
++		}
++	}
++	if (result == 0) {
++		umi_sleep_us(10000);            /* the reference waits 10 ms */
++		for (; polls < FTM5_REF_ECHO_POLLS; polls++) {
++			if (!fts_read_events_ftm5(event, 1)) {
++				result = 4;
++				break;
++			}
++			if (event[0] == FTM5_EVENTID_CONTROLLER_READY ||
++			    event[0] == FTM5_EVENTID_ERROR) {
++				ftm5_print_event("ref identity", event);
++				result = 5;
++				break;
++			}
++			if (event[0] == FTM5_EVENTID_STATUS_UPDATE &&
++			    event[1] == FTM5_EVT_STATUS_ECHO &&
++			    event[2] == request[0] &&
++			    event[3] == request[1] &&
++			    event[4] == request[2]) {
++				echo = 1;
++				break;
++			}
++			umi_sleep_us(FTM5_REF_POLL_MS * 1000);
++		}
++		if (result == 0 && !echo) {
++			result = 6;
++		}
++	}
++	if (result == 0 &&
++	    !fts_read_framebuffer(0, after, sizeof(after))) {
++		result = 7;
++	}
++	if (result == 0) {
++		after_count = after[2] | (after[3] << 8);
++		if (after[0] != FTM5_HEADER_SIGNATURE ||
++		    after[1] != FTM5_LOAD_LOCKDOWN || after[4] != 0 ||
++		    after_count != ((before_count + 1) & 0xffff)) {
++			result = 8;
++		}
++		for (unsigned i = 0; i < FTM5_LOCKDOWN_SIZE; i++) {
++			if (after[FTM5_LOCKDOWN_DATA_OFFSET + i] == expected[i]) {
++				matched++;
++			}
++		}
++		if (result == 0 && matched != FTM5_LOCKDOWN_SIZE) {
++			result = 9;
++		}
++	}
++	printf("UMI TOUCH: ref identity: result %u (0 ok, 1 read, 2 head, 3 write, "
++	    "4 poll, 5 ready/fault, 6 no echo, 7 reread, 8 head/counter, "
++	    "9 identity), %u poll(s), echo %s, counter %u -> %u, %u/8 expected\n",
++	    result, polls, echo ? "seen" : "not seen", before_count,
++	    after_count, matched);
++	if (result == 0 || result == 9) {
++		ftm5_hex_dump("ref identity", &after[FTM5_LOCKDOWN_DATA_OFFSET],
++		    FTM5_LOCKDOWN_SIZE);
++	}
++}
++
++/*
++ * The whole reference startup. Called instead of the mainline block and
++ * instead of umi_touch_seq's: the reference has neither, and running them
++ * together is what the two A/B runs exist to keep apart.
++ */
++static bool
++ftm5_ref_startup(void)
++{
++	const uint8_t sense_off[3] = {
++		FTM5_CMD_SCAN_MODE, FTM5_SCAN_MODE_ACTIVE, 0x00
++	};
++	const uint8_t sense_on[3] = {
++		FTM5_CMD_SCAN_MODE, FTM5_SCAN_MODE_ACTIVE, FTM5_SCAN_ACTIVE_MT
++	};
++	const uint8_t gesture[6] = {
++		FTM5_CMD_FEATURE, FTM5_FEAT_SEL_GESTURE, 0x00, 0x00, 0x00, 0x03
++	};
++	uint8_t crc = 0;
++	bool crc_ok;
++
++	printf("UMI TOUCH: ref: the reference startup, %u byte(s) per 0x86 read, "
++	    "READY window %u ms\n", events_burst * FTS_EVENT_SIZE,
++	    FTM5_REF_READY_MS);
++	printf("UMI TOUCH: ref: 1) GPIO reset 1\n");
++	ftm5_reset_pulse();
++	if (!ftm5_ref_ready("first reset", 1)) {
++		return false;
++	}
++	printf("UMI TOUCH: ref: 2) sysinfo, 13 chunks of 16 bytes against the "
++	    "208-byte read\n");
++	ftm5_sysinfo_chunked_check();
++	crc_ok = fts_read_registers(FTM5_ADDR_CRC, &crc, 1);
++	printf("UMI TOUCH: ref: 3) ADDR_CRC %#x: %s %02x, & 3 = %u%s\n",
++	    FTM5_ADDR_CRC, crc_ok ? "acked" : "NOT acked", crc,
++	    (unsigned)(crc & FTM5_CRC_MASK),
++	    (crc & FTM5_CRC_MASK) == 0 ? " (clean)" :
++	    " (the reference refuses to sense on this)");
++	printf("UMI TOUCH: ref: 4) lockdown identity, read only\n");
++	ftm5_ref_identity();
++	printf("UMI TOUCH: ref: 5) GPIO reset 2, the CRC-check reset\n");
++	ftm5_reset_pulse();
++	if (!ftm5_ref_ready("reset 2", 2)) {
++		return false;
++	}
++	printf("UMI TOUCH: ref: 6) GPIO reset 3, the post-version reset\n");
++	ftm5_reset_pulse();
++	if (!ftm5_ref_ready("reset 3", 3)) {
++		return false;
++	}
++	printf("UMI TOUCH: ref: 7) sensing: sense off A0 00 00: %s\n",
++	    fts_write_bytes(sense_off, sizeof(sense_off)) ? "acked" : "NOT acked");
++	umi_sleep_us(50000);                    /* WAIT_AFTER_SENSEOFF, 50 ms */
++	printf("UMI TOUCH: ref: 7) sensing: sense on A0 00 01: %s\n",
++	    fts_write_bytes(sense_on, sizeof(sense_on)) ? "acked" : "NOT acked");
++	printf("UMI TOUCH: ref: 7) sensing: gesture A2 03 00 00 00 03: %s\n",
++	    fts_write_bytes(gesture, sizeof(gesture)) ? "acked" : "NOT acked");
++	umi_spin_ms(20);
++	(void)ftm5_dump_fifo("ref after sensing");
++	printf("UMI TOUCH: ref: sensing done, one event per 0x86 from here, "
++	    "int %s\n", gpio_get(PIN_INT) ? "high" : "low");
++	return true;
++}
++
+ static unsigned
+ ftm5_hex_nibble(char c)
+ {
+@@ -2408,6 +2736,15 @@
+ 
+ 	if (reset_mode == 2) {
+ 		printf("UMI TOUCH: FTM5 reset skipped (umi_touch_reset=2)\n");
++	} else if (umi_ref) {
++		/*
++		 * The reference counts three resets of its own and the first one
++		 * is the first pulse after the pins are taken, so this guard
++		 * would be a fourth. probe() has already pulsed the pin once and
++		 * ftm5_check_id below polls for two seconds, so the application is
++		 * up without it.
++		 */
++		printf("UMI TOUCH: FTM5 reset left to the reference startup\n");
+ 	} else {
+ 		for (unsigned attempt = 0; attempt < 3 && !ready; attempt++) {
+ 			ftm5_reset_pulse();
+@@ -2425,6 +2762,15 @@
+ 	    FTM5_ADDR_DCHIP_FW_VER);
+ 
+ 	/*
++	 * umi_touch_sysinfo_chunked=1: the long read against the native one, on
++	 * the state the reset above just produced. umi_touch_ref=1 runs the same
++	 * comparison inside its own startup, so it is not run twice.
++	 */
++	if (umi_sysinfo_chunked && !umi_ref) {
++		ftm5_sysinfo_chunked_check();
++	}
++
++	/*
+ 	 * The vendor's own readings, taken before anything is written to the
+ 	 * part: the CRC register with the sysinfo block and the events the boot
+ 	 * left in the FIFO (umi_touch_crc), and any register named on the
+@@ -2438,15 +2784,21 @@
+ 	}
+ 
+ 	/*
+-	 * Two bring-ups: the mainline one below (a reset pulse, four one-byte
+-	 * host commands, a legacy register write and A0 00 01) and, with
+-	 * umi_touch_seq=1, the vendor's own (reset, sysinfo, CRC, panel init,
+-	 * A0 00 01, A2 03 00 00 00 03) with none of the mainline commands in
+-	 * it. They are mutually exclusive because the mainline block is what
+-	 * the vendor's 4.9 driver does not have and what the FIFO went silent
+-	 * after in the first log that had it.
++	 * Three bring-ups, mutually exclusive: the mainline one below (a reset
++	 * pulse, four one-byte host commands, a legacy register write and
++	 * A0 00 01), umi_touch_seq=1's vendor path (reset, sysinfo, CRC, panel
++	 * init, A0 00 01, A2 03 00 00 00 03) and umi_touch_ref=1's reference
++	 * path (three resets with a READY each, chunked sysinfo, ADDR_CRC,
++	 * identity, sensing). The mainline block is what neither vendor path
++	 * has and what the FIFO went silent after in the first log that had it,
++	 * and the two vendor paths are separate because the reference does
++	 * neither the panel init nor the A2 gesture in its own startup.
+ 	 */
+-	if (umi_seq) {
++	if (umi_ref) {
++		if (!ftm5_ref_startup()) {
++			return false;
++		}
++	} else if (umi_seq) {
+ 		if (!ftm5_vendor_seq()) {
+ 			return false;
+ 		}
+@@ -2795,6 +3147,7 @@
+ 	uint32_t legacy = 0, ev = 0, rdump = 0, burst = FTM5_EVENT_BURST;
+ 	uint32_t cal = 1, ier = 0, raw = 0;
+ 	uint32_t crc = 0, seq = 0, scantest = 0;
++	uint32_t ref = 0, chunked = 0, single = 0;
+ 	uint32_t scanmask = FTM5_SCAN_ACTIVE_MT;
+ 	uint8_t high = 0, low = 0;
+ 	unsigned idle = 0, idle_looks;
+@@ -2824,13 +3177,30 @@
+ 	(void)PE_parse_boot_argn("umi_touch_crc", &crc, sizeof(crc));
+ 	(void)PE_parse_boot_argn("umi_touch_seq", &seq, sizeof(seq));
+ 	(void)PE_parse_boot_argn("umi_touch_scantest", &scantest, sizeof(scantest));
++	/*
++	 * umi_touch_ref=1, umi_touch_sysinfo_chunked=1 and
++	 * umi_touch_event_single=1: the reference implementation's startup, the
++	 * chunked sysinfo comparison and one event per 0x86 read. All three are
++	 * off by default and none of them writes the part.
++	 */
++	(void)PE_parse_boot_argn("umi_touch_ref", &ref, sizeof(ref));
++	(void)PE_parse_boot_argn("umi_touch_sysinfo_chunked", &chunked, sizeof(chunked));
++	(void)PE_parse_boot_argn("umi_touch_event_single", &single, sizeof(single));
+ 	umi_crc = crc != 0;
+ 	umi_scantest = scantest != 0;
+ 	umi_seq = seq > 2 ? 1 : seq;
++	umi_ref = ref != 0;
++	umi_sysinfo_chunked = chunked != 0;
++	umi_event_single = single != 0;
+ 	(void)PE_parse_boot_arg_str("umi_touch_regs", umi_regs, sizeof(umi_regs));
+ 	if (burst >= 1 && burst <= FTM5_EVENT_BURST_MAX) {
+ 		events_burst = burst;
+ 	}
++	if ((umi_ref || umi_event_single) && events_burst != 1) {
++		events_burst = 1;
++		printf("UMI TOUCH: one event per 0x86 read, as the reference reads "
++		    "the FIFO\n");
++	}
+ 	if (scanmask <= 0xff) {
+ 		scan_mode = scanmask;
+ 	}
