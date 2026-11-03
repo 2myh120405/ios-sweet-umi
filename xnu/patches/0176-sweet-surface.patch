@@ -1,0 +1,754 @@
+0176 — SweetSurface: IOSurface lifecycle semantics + IOMFB current-mode block (applies after 0175)
+
+基线 chainG（0158→0175 全应用）。只改 iokit/Kernel/arm 下三个文件：
+SweetSurface.h / SweetSurface.cpp / SweetFramebuffer.cpp；不新增文件、不改 conf/files。
+应用：
+  cd work/chainG && patch -p1 --fuzz=0 < work/patches/0176-sweet-surface.patch
+
+改了什么：
+  A. selector 79 (kern_GetBlock) 的 0x40 块：+4 写 ColorElements 的 ID、+8 写
+     TimingElements 的 ID（都是 1）。原来走 default 返回全 0，CA 读到的“当前
+     mode”是 (0,0)，和 publishModes() 发布的 (1,1) 对不上。日志里 backboardd
+     在第一次 swap 之前确实调了 sel 79（40 字节），这是显示链路上唯一一个
+     与参考实现不同、且发生在冻结之前的协议差异。
+  B. IOSurface 共享状态页按 IOSurface.framework 的真实布局初始化：+0x14 tiled、
+     +0x2d displayable=1、+0x2e sysMemOnly、+0x18 两个 use 计数、+0xc seed、
+     +0x20 values seed。原来整页是 0，等于告诉用户态“这个 surface 不可显示”。
+  C. sweetfb_surface=1 时 traps 0/1 实现 Increment/DecrementUseCount：按 view
+     计数，写回状态页 +0x18（低 32 位 category 0、高 32 位 category 1），
+     view 销毁时在 SweetSurfaceRef::free() 里扣回，不会留下永久 in-use。
+     开关关闭时仍是原来的“成功但不改页”。
+  D. traps 4/5 恢复 detach/release 两步语义（参考实现与 HackiOS 都是这样）：
+     4 只把 view 标记 detached，5 才减 count/解除映射。原来两个都走 release，
+     在 detach 与 release 之间发生的 lookup 会把同一个 id 再映射一次。
+  E. 修 addRef/returnSurface 的引用记账：existing 分支由调用者持一份 ref，
+     returnSurface 末尾 release；正常分支 fRefs 与调用者各持一份。输出失败时
+     只撤销“这一个 view”，不再按 id 调 trapRelease 误删旧 view。
+  F. 诊断 sweetfb_surface_diag=1：每 60 次打印 SwapBegin/SwapEnd/SwapWait、
+     trap 0..5、GetBlock，以及每个 swap surface 的 use/seed/vseed/tiled/
+     displayable/sysmem/users；另打印 registerNotificationPort（看 CA 到底有
+     没有注册通知端口）。前 8 条不受 60 限流。
+  G. 新增全局开关：sweet_surface_set_modern()/set_diag()，由 AppleCLCD::start
+     解析 boot-arg 后设置（在创建 panel surface 之前）。
+
+默认行为：sweetfb_surface 未设置时 A/B 不生效（sel 79 仍返回全 0，状态页仍
+全 0）；C 只在 sweetfb_surface=1 时才改变状态页（计数本身总是可加）；
+D/E 是无条件修正（只修引用/映射 bug，不改变对 CA 可见的数据）；F 只在
+sweetfb_surface_diag=1 时打印。验证通过后要默认开启：把 AppleCLCD::start
+里 `fbSurfaceModern = true;` 前的 boot-arg 判断去掉（或让 fbSurfaceModern
+初值为 true），并删掉 sweet_fb_get_block() 里的 `&& fbSurfaceModern`。
+
+未编译：本机/WSL 的 bt-now 头文件在 C++ 模式下连基线也报 20 个内核头错误
+（见报告“编译检查”一节），不能作为判据；按 CI 的 -fsyntax-only 再上机。
+本段说明写在第一个 "---" 之前，patch(1) 会忽略它；hunk 内的注释随代码一起加。
+
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,8 +39,9 @@
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	uint32_t                  useCount[2]; /* 0176: IOSurfaceIncrementUseCount */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { useCount[0] = useCount[1] = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -61,5 +62,33 @@
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
++/*
++ * 0176: a read-only view of one surface's shared state page, for the
++ * framebuffer's sweetfb_surface_diag=1 tracing.  Returns false when the id is
++ * not in the table.  use0/use1 are the two 32-bit use counters at state+0x18
++ * (IOSurfaceIncrementUseCount categories 0 and 1); seed is state+0xc,
++ * valuesSeed state+0x20; the flags are state+0x14 (tiled), +0x2d
++ * (displayable) and +0x2e (sysMemOnly).
++ */
++struct sweet_surface_status {
++	uint32_t id;
++	uint32_t use0, use1;
++	uint32_t seed, valuesSeed;
++	uint8_t  tiled, displayable, sysMemOnly;
++	uint32_t refs;          /* table user count: creators, mappings, ports */
++};
++
++bool sweet_surface_status_get(uint32_t id, struct sweet_surface_status *out);
++
++/*
++ * 0176: "modern" IOSurface semantics: the IOSurface.framework layout of the
++ * shared state page (displayable/sysMemOnly/tiled/useCount at their real
++ * offsets, seed starting at 1).  Off by default; SweetFramebuffer turns it on
++ * with sweetfb_surface=1.  Diag only widens the logging.
++ */
++void sweet_surface_set_modern(bool on);
++void sweet_surface_set_diag(bool on);
++bool sweet_surface_modern(void);
++
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -65,6 +65,11 @@
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++#define SWEET_SURFACE_STATE_USE         0x18    /* u64: two u32 use counters */
++#define SWEET_SURFACE_STATE_VSEED       0x20    /* u32 values seed */
++#define SWEET_SURFACE_STATE_TILED       0x14    /* u8 */
++#define SWEET_SURFACE_STATE_DISPLAYABLE 0x2d    /* u8 */
++#define SWEET_SURFACE_STATE_SYSMEM      0x2e    /* u8 */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+ static IOLock       *sweet_surface_lock;
+@@ -75,8 +80,48 @@
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++/*
++ * 0176.  The shared state page IOSurface.framework hands to its clients is
++ * more than the registry id and seed: the library (and CoreAnimation, which
++ * reads the page directly) also looks at the flags at +0x14/+0x2d/+0x2e and
++ * the two use counters at +0x18.  A page of zeroes says "not displayable",
++ * which is not what a window-server drawable is.  The framebuffer turns this
++ * on with sweetfb_surface=1; until the machine has been validated the old
++ * all-zero page is still the default.
++ */
++static bool          sweet_surface_modern_on;
++static bool          sweet_surface_trace;
++
++void
++sweet_surface_set_modern(bool on)
++{
++	sweet_surface_modern_on = on;
++}
++
++void
++sweet_surface_set_diag(bool on)
++{
++	sweet_surface_trace = on;
++}
++
++bool
++sweet_surface_modern(void)
++{
++	return sweet_surface_modern_on;
++}
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++/* Table lock held: mirror the two use counters into the shared state page. */
++static void
++sweet_surface_store_uses_locked(SweetSurface *s)
++{
++	uint8_t *st = (uint8_t *)s->state->getBytesNoCopy();
++	uint64_t use = ((uint64_t)s->useCount[1] << 32) | s->useCount[0];
++
++	memcpy(st + SWEET_SURFACE_STATE_USE, &use, sizeof(use));
++}
++
+ void
+ SweetSurface::free()
+ {
+@@ -121,11 +166,22 @@
+ 		uint32_t id = sweet_surface_next_id;
+ 		sweet_surface_next_id = id + 1 < SWEET_SURFACE_MAX_ID ? id + 1 : 1;
+ 		if (sweet_surface_table[id] == NULL) {
++			uint8_t *st = (uint8_t *)s->state->getBytesNoCopy();
++
+ 			s->id = id;
+ 			s->retain();
+ 			sweet_surface_table[id] = s;
+ 			sweet_surface_users[id] = 1;
+-			*(uint64_t *)s->state->getBytesNoCopy() = id;   /* registry id */
++			*(uint64_t *)st = id;                           /* registry id */
++			if (sweet_surface_modern_on) {
++				/* IOSurface.framework's state page layout; see the comment at the definitions. */
++				st[SWEET_SURFACE_STATE_TILED] = 0;
++				st[SWEET_SURFACE_STATE_DISPLAYABLE] = 1;
++				st[SWEET_SURFACE_STATE_SYSMEM] = 0;
++				*(uint64_t *)(st + SWEET_SURFACE_STATE_USE) = 0;
++				*(uint32_t *)(st + SWEET_SURFACE_STATE_SEED) = 1;
++				*(uint32_t *)(st + SWEET_SURFACE_STATE_VSEED) = 1;
++			}
+ 			return true;
+ 		}
+ 	}
+@@ -183,6 +239,35 @@
+ 	return s;
+ }
+ 
++bool
++sweet_surface_status_get(uint32_t id, struct sweet_surface_status *out)
++{
++	SweetSurface *s;
++	uint8_t *st;
++
++	if (out == NULL || id == 0 || id >= SWEET_SURFACE_MAX_ID || sweet_surface_lock == NULL) {
++		return false;
++	}
++	IOLockLock(sweet_surface_lock);
++	s = sweet_surface_table[id];
++	if (s == NULL) {
++		IOLockUnlock(sweet_surface_lock);
++		return false;
++	}
++	st = (uint8_t *)s->state->getBytesNoCopy();
++	out->id = id;
++	out->use0 = *(uint32_t *)(st + SWEET_SURFACE_STATE_USE);
++	out->use1 = *(uint32_t *)(st + SWEET_SURFACE_STATE_USE + 4);
++	out->seed = *(uint32_t *)(st + SWEET_SURFACE_STATE_SEED);
++	out->valuesSeed = *(uint32_t *)(st + SWEET_SURFACE_STATE_VSEED);
++	out->tiled = st[SWEET_SURFACE_STATE_TILED];
++	out->displayable = st[SWEET_SURFACE_STATE_DISPLAYABLE];
++	out->sysMemOnly = st[SWEET_SURFACE_STATE_SYSMEM];
++	out->refs = sweet_surface_users[id];
++	IOLockUnlock(sweet_surface_lock);
++	return true;
++}
++
+ /* The table lock; the framebuffer may publish a surface before the root starts. */
+ static void
+ sweet_surface_init_lock(void)
+@@ -357,8 +442,14 @@
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	bool          detached;         /* 0176: trap 4 said goodbye, trap 5 unmaps */
++	uint32_t      use[2];           /* 0176: this view's use counts, dropped in free() */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE {
++		detached = false;
++		use[0] = use[1] = 0;
++		return OSObject::init();
++	}
+ 	void free() APPLE_KEXT_OVERRIDE;
+ };
+ 
+@@ -369,6 +460,25 @@
+ {
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
++	if (surface != NULL && (use[0] != 0 || use[1] != 0)) {
++		/*
++		 * 0176: the counters this view added must leave with it; otherwise a
++		 * client that went away while it had a surface "in use" would leave
++		 * the shared count high forever and CoreAnimation would treat the
++		 * drawable as busy.
++		 */
++		IOLockLock(sweet_surface_lock);
++		for (int c = 0; c < 2; c++) {
++			if (surface->useCount[c] >= use[c]) {
++				surface->useCount[c] -= use[c];
++			} else {
++				surface->useCount[c] = 0;
++			}
++			use[c] = 0;
++		}
++		sweet_surface_store_uses_locked(surface);
++		IOLockUnlock(sweet_surface_lock);
++	}
+ 	if (surface != NULL) {
+ 		sweet_surface_put(surface);
+ 		surface->release();
+@@ -408,7 +518,7 @@
+ 	IOLock  *fLock;
+ 	OSArray *fRefs;
+ 
+-	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
++	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index, bool detached = false);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+@@ -422,9 +532,12 @@
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapUseCount(void *id, void *category, int delta);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
++	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+ };
+ 
+@@ -480,11 +593,11 @@
+ 
+ /* Lock held. */
+ SweetSurfaceRef *
+-IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
++IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index, bool detached)
+ {
+ 	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
+ 		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
+-		if (ref->surface->id == id) {
++		if (ref->surface->id == id && ref->detached == detached) {
+ 			if (index != NULL) {
+ 				*index = i;
+ 			}
+@@ -512,6 +625,13 @@
+ 	IOLockLock(fLock);
+ 	SweetSurfaceRef *ref = findRef(s->id, NULL);
+ 	if (ref != NULL && ref->surface == s) {
++		/*
++		 * 0176: the caller gets a reference of its own; returnSurface()
++		 * drops it.  Before, the array's reference was handed out and
++		 * returnSurface() did not release, so a concurrent release could
++		 * unmap the memory while the lock result was still being filled.
++		 */
++		ref->retain();
+ 		IOLockUnlock(fLock);
+ 		sweet_surface_put(s);
+ 		*refOut = ref;
+@@ -540,14 +660,19 @@
+ 	if (raced != NULL && raced->surface == s) {
+ 		/* Another thread mapped it meanwhile: count there, drop ours. */
+ 		raced->count++;
++		raced->retain();
+ 		IOLockUnlock(fLock);
+ 		ref->release();
+ 		*refOut = raced;
+ 		return kIOReturnSuccess;
+ 	}
+-	fRefs->setObject(ref);
++	bool stored = fRefs->setObject(ref);
+ 	IOLockUnlock(fLock);
+-	ref->release();         /* fRefs holds it */
++	if (!stored) {
++		ref->release();         /* drops the caller's user count with it */
++		return kIOReturnNoMemory;
++	}
++	/* fRefs holds one reference and the caller one; returnSurface() drops the caller's. */
+ 	*refOut = ref;
+ 	return kIOReturnSuccess;
+ }
+@@ -642,9 +767,23 @@
+ 		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
+ 	}
+ 	if (ret != kIOReturnSuccess && !existing) {
+-		/* The caller never learns the id: undo this create/lookup. */
+-		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
++		/*
++		 * The caller never learns the id: undo this exact view.  Do not call
++		 * trapRelease() here: it searches by id and could remove an older,
++		 * unrelated view of the same surface.
++		 */
++		IOLockLock(fLock);
++		for (unsigned int i = 0; i < fRefs->getCount(); i++) {
++			if (fRefs->getObject(i) == ref) {
++				if (ref->count > 0 && --ref->count == 0) {
++					fRefs->removeObject(i);
++				}
++				break;
++			}
++		}
++		IOLockUnlock(fLock);
+ 	}
++	ref->release();
+ 	return ret;
+ }
+ 
+@@ -787,11 +926,89 @@
+ 	}
+ }
+ 
++/* Retained surface this client created or looked up, or NULL (defined below). */
++static SweetSurface *sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id);
++
++/* 0176: one line every 60 calls per trap with sweetfb_surface_diag=1. */
++static uint32_t sweet_trap_counts[6];
++
++static void
++sweet_trap_trace(int trap, uint32_t id, uint64_t arg0, uint64_t arg1, IOReturn ret)
++{
++	uint32_t n;
++
++	if (!sweet_surface_trace || trap < 0 || trap > 5) {
++		return;
++	}
++	n = ++sweet_trap_counts[trap];
++	if (n <= 8 || (n % 60) == 0) {
++		IOLog("SWEET SURF: trap %d id=%u arg=%llu/%llu -> 0x%x n=%u\n",
++		    trap, id, arg0, arg1, ret, n);
++	}
++}
++
++/*
++ * IOSurfaceIncrementUseCount / DecrementUseCount.  The counter lives in the
++ * shared state page at +0x18 (two 32-bit categories, category 1 in the high
++ * half), which is what IOSurfaceIsInUse() and a client's drawable recycling
++ * read.  Counts are per view and leave with it in SweetSurfaceRef::free().
++ */
++IOReturn
++IOSurfaceRootUserClient::trapUseCount(void *id, void *category, int delta)
++{
++	uint32_t sid = (uint32_t)(uintptr_t)id;
++	uint32_t cat = (uint32_t)(uintptr_t)category;
++	SweetSurface *s = sweet_surface_held(fLock, fRefs, sid);
++	IOReturn ret = kIOReturnSuccess;
++	uint32_t now = 0;
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	if (cat > 1) {
++		s->release();
++		ret = kIOReturnBadArgument;
++		sweet_trap_trace(delta > 0 ? 0 : 1, sid, cat, 0, ret);
++		return ret;
++	}
++	if (!sweet_surface_modern_on) {
++		/* Baseline behaviour: the call succeeds, the page is not touched. */
++		s->release();
++		sweet_trap_trace(delta > 0 ? 0 : 1, sid, cat, 0, kIOReturnSuccess);
++		return kIOReturnSuccess;
++	}
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef(sid, NULL);
++	if (ref == NULL) {
++		ret = kIOReturnNotFound;
++	} else if (delta > 0 || ref->use[cat] != 0) {
++		ref->use[cat] += (uint32_t)delta;
++		IOLockLock(sweet_surface_lock);
++		if (delta > 0 || s->useCount[cat] != 0) {
++			s->useCount[cat] += (uint32_t)delta;
++		}
++		sweet_surface_store_uses_locked(s);
++		IOLockUnlock(sweet_surface_lock);
++		now = ref->use[cat];
++	}
++	IOLockUnlock(fLock);
++	s->release();
++	sweet_trap_trace(delta > 0 ? 0 : 1, sid, cat, now, ret);
++	return ret;
++}
++
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
++IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category,
+     void *, void *, void *, void *)
+ {
+-	return kIOReturnSuccess;
++	return trapUseCount(id, category, 1);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category,
++    void *, void *, void *, void *)
++{
++	return trapUseCount(id, category, -1);
+ }
+ 
+ static IOReturn
+@@ -829,9 +1046,13 @@
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
++		sweet_trap_trace(2, (uint32_t)(uintptr_t)id, (uint64_t)(uintptr_t)options, 0,
++		    kIOReturnNotFound);
+ 		return kIOReturnNotFound;
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
++	sweet_trap_trace(2, s->id, (uint64_t)(uintptr_t)options,
++	    (uint64_t)*sweet_surface_seed(s), ret);
+ 	s->release();
+ 	return ret;
+ }
+@@ -842,33 +1063,75 @@
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
++		sweet_trap_trace(3, (uint32_t)(uintptr_t)id, (uint64_t)(uintptr_t)options, 0,
++		    kIOReturnNotFound);
+ 		return kIOReturnNotFound;
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	sweet_trap_trace(3, s->id, (uint64_t)(uintptr_t)options,
++	    (uint64_t)*sweet_surface_seed(s), ret);
+ 	s->release();
+ 	return ret;
+ }
+ 
++/*
++ * 0176: the framework drops a surface in two steps: trap 4 while it still holds
++ * its client (detach: a later lookup must build a fresh view), trap 5 after it
++ * (release: unmap and drop the table user).  Mapping both to release, as the
++ * 0046 port did, removed the view under a lookup that ran between the two.
++ */
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, void *)
++{
++	uint32_t sid = (uint32_t)(uintptr_t)id;
++
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef(sid, NULL);
++	if (ref != NULL) {
++		ref->detached = true;
++	}
++	IOLockUnlock(fLock);
++	sweet_trap_trace(4, sid, 0, 0, kIOReturnSuccess);
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
+ {
++	uint32_t sid = (uint32_t)(uintptr_t)id;
+ 	unsigned int index;
++	IOReturn ret = kIOReturnNotFound;
++
+ 	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
+-	if (ref != NULL && --ref->count == 0) {
+-		fRefs->removeObject(index);     /* unmaps and drops the user count */
++	SweetSurfaceRef *ref = findRef(sid, &index, true);
++	if (ref == NULL) {
++		ref = findRef(sid, &index);
++	}
++	if (ref != NULL) {
++		uint32_t left = 0;
++		if (ref->count > 0) {
++			left = --ref->count;
++		}
++		if (ref->count == 0) {
++			fRefs->removeObject(index);     /* unmaps and drops the user count */
++		}
++		ret = kIOReturnSuccess;
++		IOLockUnlock(fLock);
++		sweet_trap_trace(5, sid, left, 0, ret);
++		return ret;
+ 	}
+ 	IOLockUnlock(fLock);
+-	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++	sweet_trap_trace(5, sid, 0, 0, ret);
++	return ret;
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+-	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
++	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },
+ 	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -66,6 +66,7 @@
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBGetBlock                = 79,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -159,6 +160,19 @@
+ static bool fbNotifyDiag;
+ static uint64_t fbNotifySent, fbNotifyDropped;
+ 
++/*
++ * 0176.  sweetfb_surface=1 turns on the IOSurface semantics the window server
++ * expects (state page flags + a valid current-mode block).  It is off by
++ * default until the machine has been validated; the report says how to make it
++ * the default.  sweetfb_surface_diag=1 adds one line per 60 SwapBegin /
++ * SwapEnd / SwapWait / trap / GetBlock calls, plus the surface's use counters
++ * and flags.
++ */
++static bool     fbSurfaceModern;
++static bool     fbSurfaceDiag;
++static uint64_t fbSwapBeginN, fbSwapEndN, fbSwapWaitN, fbGetBlockN;
++static uint32_t fbPortLogs;
++
+ static void
+ sweet_set_number(OSDictionary *d, const char *key, uint64_t value)
+ {
+@@ -169,6 +183,87 @@
+ 	}
+ }
+ 
++/* sweetfb_surface_diag=1: the shared-state view of one swapped surface. */
++static void
++sweet_fb_surface_line(const char *what, uint32_t id)
++{
++	struct sweet_surface_status st;
++
++	if (!fbSurfaceDiag) {
++		return;
++	}
++	if (sweet_surface_status_get(id, &st)) {
++		IOLog("SWEET FB: %s surface %u use=%u/%u seed=%u vseed=%u tiled=%u disp=%u sysmem=%u users=%u\n",
++		    what, id, st.use0, st.use1, st.seed, st.valuesSeed,
++		    st.tiled, st.displayable, st.sysMemOnly, st.refs);
++	} else {
++		IOLog("SWEET FB: %s surface %u not in the table\n", what, id);
++	}
++}
++
++/*
++ * 0176: selector 79 (kern_GetBlock).  CoreAnimation reads the current display
++ * mode from block 0x40: two u32 identifiers at +4 (colour) and +8 (timing),
++ * which must be the IDs published in ColorElements/TimingElements (1 and 1).
++ * The old default path answered a zeroed buffer, i.e. mode (0, 0), so the
++ * library could not match the mode it had enumerated.  Other blocks keep the
++ * old all-zero answer.
++ */
++static IOReturn
++sweet_fb_get_block(IOExternalMethodArguments *args)
++{
++	uint64_t block = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++	bool descriptor = args->structureOutputDescriptor != NULL;
++	uint32_t n = (uint32_t)(descriptor ? args->structureOutputDescriptor->getLength()
++	                                  : args->structureOutputSize);
++	uint8_t *buf;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (n == 0) {
++		return kIOReturnSuccess;
++	}
++	if (n > 4096) {
++		return kIOReturnBadArgument;
++	}
++	if (!descriptor && args->structureOutput == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (descriptor) {
++		buf = (uint8_t *)IOMallocData(n);
++		if (buf == NULL) {
++			return kIOReturnNoMemory;
++		}
++	} else {
++		buf = (uint8_t *)args->structureOutput;
++	}
++	bzero(buf, n);
++	if (block == 0x40 && n >= 12 && fbSurfaceModern) {
++		uint32_t ids[2] = { SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID };
++		memcpy(buf + 4, ids, sizeof(ids));
++	}
++	if (descriptor) {
++		IOMemoryDescriptor *out = args->structureOutputDescriptor;
++		ret = out->prepare();
++		if (ret == kIOReturnSuccess) {
++			bool full = out->writeBytes(0, buf, n) == n;
++			IOReturn completed = out->complete();
++			if (!full) {
++				ret = kIOReturnVMError;
++			} else if (completed != kIOReturnSuccess) {
++				ret = completed;
++			} else {
++				args->structureOutputDescriptorSize = n;
++			}
++		}
++		IOFreeData(buf, n);
++	}
++	if (fbSurfaceDiag && (++fbGetBlockN <= 8 || (fbGetBlockN % 60) == 0)) {
++		IOLog("SWEET FB: GetBlock block=0x%llx n=%u color=%u timing=%u -> 0x%x n=%llu\n",
++		    block, n, SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID, ret, fbGetBlockN);
++	}
++	return ret;
++}
++
+ /*
+  * Publish the display's timing and colour elements. IOMobileFramebuffer.framework
+  * enumerates display modes through these two arrays; a service without them is a
+@@ -240,6 +335,21 @@
+ 		}
+ 		printf("SWEET FB: notify diag %s\n", fbNotifyDiag ? "on" : "off");
+ 	}
++	{
++		uint32_t on = 0;
++
++		if (PE_parse_boot_argn("sweetfb_surface", &on, sizeof(on)) && on != 0) {
++			fbSurfaceModern = true;
++		}
++		on = 0;
++		if (PE_parse_boot_argn("sweetfb_surface_diag", &on, sizeof(on)) && on != 0) {
++			fbSurfaceDiag = true;
++		}
++		sweet_surface_set_modern(fbSurfaceModern);
++		sweet_surface_set_diag(fbSurfaceDiag);
++		printf("SWEET FB: surface semantics %s, surface diag %s\n",
++		    fbSurfaceModern ? "on" : "off", fbSurfaceDiag ? "on" : "off");
++	}
+ 
+ 	printf("SWEET FB: AppleCLCD::start entered\n");
+ 
+@@ -565,6 +675,12 @@
+ 	if (old != MACH_PORT_NULL) {
+ 		releaseNotificationPort(old);
+ 	}
++	if (fbPortLogs++ < 8) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET FB: %s notification port %u type %u refcon %llu\n",
++		    name, port, type, (uint64_t)refCon);
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -619,6 +735,9 @@
+ 		out[0] = ++fFB->fSwapID;
+ 		IOLockUnlock(fFB->fLock);
+ 		outCount = 1;
++		if (fbSurfaceDiag && (++fbSwapBeginN <= 8 || (fbSwapBeginN % 60) == 0)) {
++			IOLog("SWEET FB: SwapBegin id=%llu n=%llu\n", out[0], fbSwapBeginN);
++		}
+ 		break;
+ 	case kSweetFBSwapEnd: {
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+@@ -628,6 +747,18 @@
+ 			break;
+ 		}
+ 		memcpy(rec, args->structureInput, sizeof(rec));
++		if (fbSurfaceDiag && (++fbSwapEndN <= 8 || (fbSwapEndN % 60) == 0)) {
++			uint32_t mask = get32(rec, 0x104);
++			IOLog("SWEET FB: SwapEnd id=%u mask=0x%x ids=%u,%u,%u,%u n=%llu\n",
++			    get32(rec, 0x50), mask, get32(rec, 0x54), get32(rec, 0x58),
++			    get32(rec, 0x5c), get32(rec, 0x60), fbSwapEndN);
++			for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++				uint32_t id = get32(rec, 0x54 + 4 * l);
++				if ((mask & (1u << l)) && id != 0) {
++					sweet_fb_surface_line("SwapEnd", id);
++				}
++			}
++		}
+ 		fFB->swap(rec);
+ 		break;
+ 	}
+@@ -648,6 +779,8 @@
+ 		out[0] = SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
++	case kSweetFBGetBlock:
++		return sweet_fb_get_block(args);
+ 	case kSweetFBNotifications: {
+ 		/* 0173 removed the scalarInputCount check from this path and left the
+ 		 * checked body behind as dead code: read only what the caller sent. */
+@@ -681,6 +814,18 @@
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
++		/*
++		 * 0176: the reference treats a swap as on screen at SwapEnd, so this
++		 * stays a successful no-op.  It is traced because a client waiting
++		 * here forever is exactly the "frames stop" shape we are chasing.
++		 */
++		if (fbSurfaceDiag && (++fbSwapWaitN <= 8 || (fbSwapWaitN % 60) == 0)) {
++			IOLog("SWEET FB: SwapWait id=%llu timeout=%llu n=%llu\n",
++			    args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
++			    args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
++			    fbSwapWaitN);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
