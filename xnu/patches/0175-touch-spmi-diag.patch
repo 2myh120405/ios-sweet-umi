@@ -1,0 +1,64 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -89,9 +89,9 @@
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x4c)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+ 	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+--- a/bsd/dev/umi_touch.c
++++ b/bsd/dev/umi_touch.c
+@@ -3343,8 +3343,48 @@
+ 				printf("UMI TOUCH: %s (%u mV) -> %d\n", rails[i].name, rails[i].mv, e);
+ 				umi_spin_ms(10);
+ 			}
+ 			show_pins("rails on");
++
++			/*
++			 * umi_touch_spmi=1: ask the PMIC itself what the touch analog rail
++			 * (pm8150_l13, SPMI peripheral 0x4c) is doing. The RPMh vote only says
++			 * the request was accepted; the LDO's own enable, voltage and mode
++			 * bits are what decide whether the AFE has its 3.0 V.
++			 */
++			{
++				uint32_t spmi = 0;
++
++				if (PE_parse_boot_argn("umi_touch_spmi", &spmi, sizeof(spmi)) && spmi) {
++					extern int sweet_spmi_init(void);
++					extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++					if (sweet_spmi_init() == 0) {
++						static const struct {
++							const char *name;
++							unsigned addr;
++						} ldo13[] = {
++							{ "0x4c40 range",  0x4c40 },
++							{ "0x4c41 vset",   0x4c41 },
++							{ "0x4c45 mode",   0x4c45 },
++							{ "0x4c46 enable", 0x4c46 },
++							{ "0x4c44 pd",     0x4c44 },
++						};
++
++						for (unsigned i = 0; i < sizeof(ldo13) / sizeof(ldo13[0]); i++) {
++							uint8_t v = 0;
++
++							if (sweet_spmi_read(0, ldo13[i].addr, &v) == 0) {
++								printf("UMI TOUCH: spmi %s = %#04x\n", ldo13[i].name, v);
++							} else {
++								printf("UMI TOUCH: spmi %s read failed\n", ldo13[i].name);
++							}
++						}
++					} else {
++						printf("UMI TOUCH: spmi init failed\n");
++					}
++				}
++			}
+ 		}
+ 
+ 	{
+ 		uint32_t fa = 0;
